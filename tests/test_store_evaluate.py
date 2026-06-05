@@ -1,9 +1,17 @@
+import os
+import threading
+
 import pandas as pd
 
 from alphasift.config import Config
-from alphasift.evaluate import evaluate_result_against_snapshot, evaluate_saved_runs
+from alphasift.evaluate import evaluate_result_against_snapshot, evaluate_saved_run, evaluate_saved_runs
 from alphasift.models import Pick, ScreenResult
-from alphasift.store import load_screen_result, save_screen_result, screen_result_to_jsonl
+from alphasift.store import (
+    list_saved_runs,
+    load_screen_result,
+    save_screen_result,
+    screen_result_to_jsonl,
+)
 
 
 def test_save_and_load_screen_result(tmp_path):
@@ -20,6 +28,48 @@ def test_save_and_load_screen_result(tmp_path):
     assert path.name == "run123.json"
     assert loaded.picks[0].code == "000001"
     assert loaded.saved_path == str(path)
+
+
+def test_list_saved_runs_reads_only_metadata_until_limit(tmp_path):
+    result = ScreenResult(
+        strategy="dual_low",
+        market="cn",
+        run_id="run_metadata",
+        created_at="2026-04-01T09:30:00",
+        picks=[Pick(rank=1, code="000001", name="平安银行", final_score=80, screen_score=80, price=10)],
+    )
+    path = save_screen_result(result, data_dir=tmp_path)
+    path.write_text("{not-valid-json", encoding="utf-8")
+
+    runs = list_saved_runs(data_dir=tmp_path, limit=1)
+
+    assert runs == [{
+        "run_id": "run_metadata",
+        "strategy": "dual_low",
+        "market": "cn",
+        "created_at": "2026-04-01T09:30:00",
+        "picks": 1,
+        "path": str(path),
+    }]
+
+
+def test_list_saved_runs_falls_back_to_payload_when_metadata_missing(tmp_path):
+    path = save_screen_result(
+        ScreenResult(
+            strategy="dual_low",
+            market="cn",
+            run_id="run_legacy",
+            created_at="2026-04-01T09:30:00",
+            picks=[Pick(rank=1, code="000001", name="平安银行", final_score=80, screen_score=80, price=10)],
+        ),
+        data_dir=tmp_path,
+    )
+    path.with_suffix(path.suffix + ".meta").unlink(missing_ok=True)
+
+    runs = list_saved_runs(data_dir=tmp_path, limit=1)
+
+    assert runs[0]["run_id"] == "run_legacy"
+    assert runs[0]["picks"] == 1
 
 
 def test_screen_result_jsonl_contains_run_and_pick_lines():
@@ -244,3 +294,176 @@ def test_evaluate_saved_runs_aggregates_by_strategy(tmp_path, monkeypatch):
     assert result["summary"]["path_pick_count"] == 2
     assert result["summary"]["average_max_drawdown_pct"] == -7.5
     assert result["cost_bps"] == 0.0
+
+
+def test_evaluate_saved_runs_uses_parallel_price_path_fetch_without_order_drift(tmp_path, monkeypatch):
+    save_screen_result(
+        ScreenResult(
+            strategy="dual_low",
+            market="cn",
+            run_id="run_parallel",
+            created_at="2026-04-01T09:30:00",
+            picks=[
+                Pick(rank=1, code="000003", name="招商银行", final_score=90, screen_score=90, price=30),
+                Pick(rank=2, code="000001", name="平安银行", final_score=80, screen_score=80, price=10),
+                Pick(rank=3, code="600000", name="浦发银行", final_score=70, screen_score=70, price=20),
+            ],
+        ),
+        data_dir=tmp_path,
+    )
+    snapshot = pd.DataFrame([
+        {"code": "000001", "price": 11},
+        {"code": "600000", "price": 18},
+        {"code": "000003", "price": 33},
+    ])
+    snapshot.attrs["snapshot_source"] = "test"
+    paths = {
+        "000003": [
+            {"日期": "2026-04-01", "收盘": 30.0, "最高": 31.5, "最低": 28.5},
+            {"日期": "2026-04-02", "收盘": 33.0, "最高": 36.0, "最低": 27.0},
+        ],
+        "000001": [
+            {"日期": "2026-04-01", "收盘": 10.0, "最高": 10.5, "最低": 9.5},
+            {"日期": "2026-04-02", "收盘": 11.0, "最高": 11.5, "最低": 9.0},
+        ],
+        "600000": [
+            {"日期": "2026-04-01", "收盘": 20.0, "最高": 20.5, "最低": 18.0},
+            {"日期": "2026-04-02", "收盘": 18.0, "最高": 21.0, "最低": 17.0},
+        ],
+    }
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+    overlap_seen = threading.Event()
+
+    def fake_fetch_daily_history(code, **kwargs):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+            if active >= 2:
+                overlap_seen.set()
+        try:
+            overlap_seen.wait(timeout=0.25)
+            return pd.DataFrame(paths[code])
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr("alphasift.evaluate.fetch_daily_history", fake_fetch_daily_history)
+
+    aggregate = evaluate_saved_runs(
+        config=Config(llm_api_key="", data_dir=tmp_path),
+        current_snapshot=snapshot,
+        limit=10,
+        cost_bps=0,
+        with_price_path=True,
+    )
+    evaluation = evaluate_saved_run(
+        "run_parallel",
+        config=Config(llm_api_key="", data_dir=tmp_path),
+        current_snapshot=snapshot,
+        cost_bps=0,
+        with_price_path=True,
+    )
+
+    assert max_active >= 2
+    assert aggregate["summary"]["path_pick_count"] == 3
+    assert [pick.code for pick in evaluation.picks] == ["000003", "000001", "600000"]
+    assert [pick.path_end_return_pct for pick in evaluation.picks] == [10.0, 10.0, -10.0]
+    assert [pick.max_drawdown_pct for pick in evaluation.picks] == [-10.0, -10.0, -15.0]
+
+
+def test_evaluate_saved_runs_uses_cached_price_paths(tmp_path, monkeypatch):
+    for run_id in ("run_cache_a", "run_cache_b"):
+        save_screen_result(
+            ScreenResult(
+                strategy="dual_low",
+                market="cn",
+                run_id=run_id,
+                created_at="2026-04-01T09:30:00",
+                picks=[
+                    Pick(
+                        rank=1,
+                        code="SZ000001",
+                        name="平安银行",
+                        final_score=80,
+                        screen_score=80,
+                        price=10,
+                    )
+                ],
+            ),
+            data_dir=tmp_path,
+        )
+    snapshot = pd.DataFrame([{"code": "000001", "price": 11}])
+    snapshot.attrs["snapshot_source"] = "test"
+    calls = {"count": 0}
+
+    def fake_fetch_daily_akshare(code, *, lookback_days):
+        calls["count"] += 1
+        return pd.DataFrame([
+            {"日期": "2026-04-01", "收盘": 10.0, "最高": 10.5, "最低": 9.5},
+            {"日期": "2026-04-02", "收盘": 11.0, "最高": 11.5, "最低": 9.0},
+        ])
+
+    monkeypatch.setattr("alphasift.daily._fetch_daily_akshare", fake_fetch_daily_akshare)
+
+    result = evaluate_saved_runs(
+        config=Config(
+            llm_api_key="",
+            data_dir=tmp_path,
+            daily_source="akshare",
+            daily_fetch_retries=0,
+            daily_history_cache_ttl_hours=24,
+        ),
+        current_snapshot=snapshot,
+        limit=10,
+        cost_bps=0,
+        with_price_path=True,
+        price_path_lookback_days=45,
+    )
+
+    assert calls["count"] == 1
+    assert result["summary"]["run_count"] == 2
+    assert result["summary"]["path_pick_count"] == 2
+    assert len(list((tmp_path / "daily_history").glob("*.json"))) == 1
+
+
+def test_evaluate_saved_runs_filters_strategy_before_loading_runs(tmp_path):
+    matching_path = save_screen_result(
+        ScreenResult(
+            strategy="dual_low",
+            market="cn",
+            run_id="run_matching",
+            created_at="2026-04-01T09:30:00",
+            picks=[Pick(rank=1, code="000001", name="平安银行", final_score=80, screen_score=80, price=10)],
+        ),
+        data_dir=tmp_path,
+    )
+    newer_nonmatching_path = save_screen_result(
+        ScreenResult(
+            strategy="volume_breakout",
+            market="cn",
+            run_id="run_newer_nonmatching",
+            created_at="2026-04-02T09:30:00",
+            picks=[Pick(rank=1, code="600000", name="浦发银行", final_score=70, screen_score=70, price=20)],
+        ),
+        data_dir=tmp_path,
+    )
+    old_time = 1_800_000_000
+    os.utime(matching_path, (old_time, old_time))
+    os.utime(newer_nonmatching_path, (old_time + 10, old_time + 10))
+    snapshot = pd.DataFrame([{"code": "000001", "price": 11}])
+    snapshot.attrs["snapshot_source"] = "test"
+
+    result = evaluate_saved_runs(
+        config=Config(llm_api_key="", data_dir=tmp_path),
+        current_snapshot=snapshot,
+        limit=1,
+        strategy="dual_low",
+        cost_bps=0,
+        with_price_path=False,
+    )
+
+    assert result["summary"]["run_count"] == 1
+    assert result["runs"][0]["run_id"] == "run_matching"

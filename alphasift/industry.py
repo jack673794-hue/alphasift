@@ -4,11 +4,22 @@
 from __future__ import annotations
 
 import json
-import re
+import os
+import time
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 
+from alphasift.normalize import (
+    normalize_code as _normalize_code,
+    safe_float as _safe_float,
+    safe_text as _safe_text,
+)
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_AKSHARE_BOARD_CACHE_SCHEMA = "v1"
+_CACHE_DIR_UNSET = object()
 _NUMERIC_FIELDS = (
     "industry_rank",
     "industry_change_pct",
@@ -45,6 +56,8 @@ def enrich_industry_concepts(
     map_files: list[str | Path] | None = None,
     provider: str = "none",
     max_boards: int = 80,
+    provider_cache_dir: str | Path | None | object = _CACHE_DIR_UNSET,
+    provider_cache_ttl_hours: float | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Attach industry/concepts columns from stable files and optional providers."""
     result = df.copy()
@@ -76,7 +89,11 @@ def enrich_industry_concepts(
 
     if provider and provider.lower() not in {"", "none", "off", "false"}:
         if provider.lower() == "akshare":
-            provider_mapping, provider_notes = fetch_akshare_board_map(max_boards=max_boards)
+            provider_mapping, provider_notes = fetch_akshare_board_map(
+                max_boards=max_boards,
+                cache_dir=provider_cache_dir,
+                cache_ttl_hours=provider_cache_ttl_hours,
+            )
             _merge_mapping(mapping, provider_mapping)
             notes.extend(provider_notes)
         else:
@@ -85,44 +102,10 @@ def enrich_industry_concepts(
     if not mapping:
         return result, notes
 
-    filled_industry = 0
-    filled_concepts = 0
-    filled_heat = 0
-    for idx, row in result.iterrows():
-        code = _normalize_code(row.get("code", ""))
-        item = mapping.get(code)
-        if not item:
-            continue
-        current_industry = _safe_text(row.get("industry"))
-        current_concepts = _safe_text(row.get("concepts"))
-        if not current_industry and item.get("industry"):
-            result.at[idx, "industry"] = item["industry"]
-            filled_industry += 1
-        if item.get("concepts"):
-            merged = _merge_label_text(current_concepts, item["concepts"])
-            if merged != current_concepts:
-                result.at[idx, "concepts"] = merged
-                filled_concepts += 1
-        for field in _NUMERIC_FIELDS:
-            value = _safe_float(item.get(field))
-            if value is None:
-                continue
-            current = _safe_float(row.get(field))
-            if current is None or _should_replace_numeric(field, value, current):
-                result.at[idx, field] = int(value) if field in {"industry_rank", "board_heat_observations"} else value
-                filled_heat += 1
-        for field in _TEXT_FIELDS:
-            value = _safe_text(item.get(field))
-            if not value:
-                continue
-            current_value = _safe_text(row.get(field))
-            if field == "board_heat_summary":
-                merged_value = _merge_summary_text(current_value, value)
-            else:
-                merged_value = current_value or value
-            if merged_value != current_value:
-                result.at[idx, field] = merged_value
-                filled_heat += 1
+    result, filled_industry, filled_concepts, filled_heat = _apply_mapping_to_snapshot(
+        result,
+        mapping,
+    )
 
     notes.append(
         "industry/concepts enrichment applied: "
@@ -189,16 +172,43 @@ def load_industry_map(path_like: str | Path) -> dict[str, dict[str, object]]:
     return mapping
 
 
-def fetch_akshare_board_map(*, max_boards: int = 80) -> tuple[dict[str, dict[str, object]], list[str]]:
+def fetch_akshare_board_map(
+    *,
+    max_boards: int = 80,
+    cache_dir: str | Path | None | object = _CACHE_DIR_UNSET,
+    cache_ttl_seconds: float | None = None,
+    cache_ttl_hours: float | None = None,
+) -> tuple[dict[str, dict[str, object]], list[str]]:
     """Build a code mapping from AkShare industry/concept board constituents.
 
     This is intentionally optional because it may require many third-party
     requests. For production, a cached CSV/JSON map is preferred.
     """
+    board_limit = max(int(max_boards), 1)
+    notes: list[str] = []
+    resolved_cache_dir = _resolve_akshare_board_cache_dir(cache_dir)
+    cache_path = (
+        _akshare_board_cache_path(resolved_cache_dir, max_boards=board_limit)
+        if resolved_cache_dir is not None
+        else None
+    )
+    if cache_path is not None:
+        cached_mapping, cache_note = _read_akshare_board_cache(
+            cache_path,
+            max_boards=board_limit,
+            ttl_seconds=_resolve_cache_ttl_seconds(
+                cache_ttl_seconds=cache_ttl_seconds,
+                cache_ttl_hours=cache_ttl_hours,
+            ),
+        )
+        if cache_note:
+            notes.append(cache_note)
+        if cached_mapping is not None:
+            return cached_mapping, notes
+
     import akshare as ak
 
     mapping: dict[str, dict[str, object]] = {}
-    notes: list[str] = []
     board_specs = [
         ("industry", ak.stock_board_industry_name_em, ak.stock_board_industry_cons_em),
         ("concepts", ak.stock_board_concept_name_em, ak.stock_board_concept_cons_em),
@@ -209,7 +219,7 @@ def fetch_akshare_board_map(*, max_boards: int = 80) -> tuple[dict[str, dict[str
         except Exception as exc:
             notes.append(f"akshare {field} board list failed: {exc}")
             continue
-        board_items = _board_items(boards)[:max(max_boards, 1)]
+        board_items = _board_items(boards)[:board_limit]
         loaded = 0
         for board_item in board_items:
             board = board_item["name"]
@@ -249,6 +259,10 @@ def fetch_akshare_board_map(*, max_boards: int = 80) -> tuple[dict[str, dict[str
                 )
             loaded += 1
         notes.append(f"akshare {field} boards loaded: {loaded}/{len(board_items)}")
+    if cache_path is not None and mapping:
+        cache_note = _write_akshare_board_cache(cache_path, mapping, max_boards=board_limit)
+        if cache_note:
+            notes.append(cache_note)
     return mapping, notes
 
 
@@ -281,6 +295,280 @@ def save_industry_map(mapping: dict[str, dict[str, object]], path_like: str | Pa
     else:
         pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8")
     return path
+
+
+def _apply_mapping_to_snapshot(
+    result: pd.DataFrame,
+    mapping: dict[str, dict[str, object]],
+) -> tuple[pd.DataFrame, int, int, int]:
+    map_df = _mapping_dataframe(mapping)
+    if map_df.empty:
+        return result, 0, 0, 0
+
+    output = result.copy()
+    work = output.copy()
+    work["__industry_row"] = range(len(work))
+    work["__industry_code"] = work["code"].map(_normalize_code)
+    merged = work.merge(map_df, on="__industry_code", how="left", sort=False)
+    merged = merged.sort_values("__industry_row", kind="stable")
+    merged.index = output.index
+
+    filled_industry = _apply_industry_column(output, merged)
+    filled_concepts = _apply_concepts_column(output, merged)
+    filled_heat = 0
+    for field in _NUMERIC_FIELDS:
+        filled_heat += _apply_numeric_column(output, merged, field)
+    for field in _TEXT_FIELDS:
+        filled_heat += _apply_text_column(output, merged, field)
+    return output, filled_industry, filled_concepts, filled_heat
+
+
+def _mapping_dataframe(mapping: dict[str, dict[str, object]]) -> pd.DataFrame:
+    fields = ("industry", "concepts", *_HEAT_FIELDS)
+    rows: list[dict[str, object]] = []
+    for code, item in mapping.items():
+        normalized = _normalize_code(code)
+        if not normalized or normalized == "000000" or not isinstance(item, dict):
+            continue
+        row = {"__industry_code": normalized}
+        for field in fields:
+            row[f"__map_{field}"] = item.get(field, pd.NA)
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame(columns=["__industry_code", *(f"__map_{field}" for field in fields)])
+    frame = pd.DataFrame(rows)
+    return frame.drop_duplicates(subset=["__industry_code"], keep="last")
+
+
+def _apply_industry_column(output: pd.DataFrame, merged: pd.DataFrame) -> int:
+    current = output["industry"].map(_safe_text)
+    incoming = merged["__map_industry"].map(_safe_text)
+    mask = current.eq("") & incoming.ne("")
+    if mask.any():
+        output.loc[mask, "industry"] = incoming[mask].to_numpy()
+    return int(mask.sum())
+
+
+def _apply_concepts_column(output: pd.DataFrame, merged: pd.DataFrame) -> int:
+    current = output["concepts"].map(_safe_text)
+    incoming = merged["__map_concepts"].map(_safe_text)
+    candidate_mask = incoming.ne("")
+    if not candidate_mask.any():
+        return 0
+    merged_values = pd.Series(
+        [
+            _merge_label_text(left, right) if right else left
+            for left, right in zip(current.tolist(), incoming.tolist(), strict=False)
+        ],
+        index=output.index,
+    )
+    mask = candidate_mask & merged_values.ne(current)
+    if mask.any():
+        output.loc[mask, "concepts"] = merged_values[mask].to_numpy()
+    return int(mask.sum())
+
+
+def _apply_numeric_column(output: pd.DataFrame, merged: pd.DataFrame, field: str) -> int:
+    incoming = merged[f"__map_{field}"].map(_safe_float)
+    current = output[field].map(_safe_float)
+    mask = _numeric_replacement_mask(field, incoming, current)
+    if not mask.any():
+        return 0
+    values = incoming[mask]
+    if field in {"industry_rank", "board_heat_observations"}:
+        values = values.map(int)
+    output.loc[mask, field] = values.to_numpy()
+    return int(mask.sum())
+
+
+def _apply_text_column(output: pd.DataFrame, merged: pd.DataFrame, field: str) -> int:
+    current = output[field].map(_safe_text)
+    incoming = merged[f"__map_{field}"].map(_safe_text)
+    candidate_mask = incoming.ne("")
+    if not candidate_mask.any():
+        return 0
+    if field == "board_heat_summary":
+        merged_values = pd.Series(
+            [
+                _merge_summary_text(left, right) if right else left
+                for left, right in zip(current.tolist(), incoming.tolist(), strict=False)
+            ],
+            index=output.index,
+        )
+    else:
+        merged_values = pd.Series(
+            [left or right for left, right in zip(current.tolist(), incoming.tolist(), strict=False)],
+            index=output.index,
+        )
+    mask = candidate_mask & merged_values.ne(current)
+    if mask.any():
+        output.loc[mask, field] = merged_values[mask].to_numpy()
+    return int(mask.sum())
+
+
+def _numeric_replacement_mask(field: str, incoming: pd.Series, current: pd.Series) -> pd.Series:
+    candidate_mask = incoming.notna()
+    missing_mask = current.isna()
+    comparable_mask = candidate_mask & ~missing_mask
+    wins = pd.Series(False, index=incoming.index)
+    if comparable_mask.any():
+        new_values = incoming[comparable_mask].astype(float)
+        current_values = current[comparable_mask].astype(float)
+        if field == "industry_rank":
+            wins.loc[comparable_mask] = new_values < current_values
+        elif field == "board_heat_observations":
+            wins.loc[comparable_mask] = new_values > current_values
+        elif field in {"board_heat_latest_score", "board_heat_persistence_score", "board_heat_cooling_score"}:
+            wins.loc[comparable_mask] = new_values > current_values
+        elif field == "board_heat_trend_score":
+            wins.loc[comparable_mask] = new_values.abs() > current_values.abs()
+        elif field.endswith("heat_score"):
+            wins.loc[comparable_mask] = new_values > current_values
+    return candidate_mask & (missing_mask | wins)
+
+
+def _resolve_akshare_board_cache_dir(cache_dir: str | Path | None | object) -> Path | None:
+    if cache_dir is _CACHE_DIR_UNSET:
+        return _default_akshare_board_cache_dir()
+    if cache_dir is None:
+        return None
+    return Path(cache_dir)
+
+
+def _default_akshare_board_cache_dir() -> Path:
+    explicit = (
+        os.getenv("ALPHASIFT_INDUSTRY_PROVIDER_CACHE_DIR", "").strip()
+        or os.getenv("INDUSTRY_PROVIDER_CACHE_DIR", "").strip()
+    )
+    if explicit:
+        return Path(explicit)
+    data_dir = Path(os.getenv("ALPHASIFT_DATA_DIR", str(_PROJECT_ROOT / "data")))
+    return data_dir / "industry_provider_cache"
+
+
+def _resolve_cache_ttl_seconds(
+    *,
+    cache_ttl_seconds: float | None,
+    cache_ttl_hours: float | None,
+) -> float:
+    if cache_ttl_seconds is not None:
+        return float(cache_ttl_seconds)
+    if cache_ttl_hours is not None:
+        return float(cache_ttl_hours) * 3600
+    raw_hours = (
+        os.getenv("ALPHASIFT_INDUSTRY_PROVIDER_CACHE_TTL_HOURS", "").strip()
+        or os.getenv("INDUSTRY_PROVIDER_CACHE_TTL_HOURS", "").strip()
+        or "24"
+    )
+    return max(0.0, float(raw_hours)) * 3600
+
+
+def _akshare_board_cache_path(cache_dir: Path, *, max_boards: int) -> Path:
+    return cache_dir / f"akshare_board_map_{_AKSHARE_BOARD_CACHE_SCHEMA}_max_boards_{int(max_boards)}.json"
+
+
+def _read_akshare_board_cache(
+    path: Path,
+    *,
+    max_boards: int,
+    ttl_seconds: float,
+) -> tuple[dict[str, dict[str, object]] | None, str]:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None, ""
+    if ttl_seconds <= 0:
+        return None, f"industry provider cache expired: {path}"
+    age_seconds = time.time() - stat.st_mtime
+    if age_seconds > ttl_seconds:
+        return None, f"industry provider cache expired: {path}"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return None, f"industry provider cache skipped: {path} error={exc}"
+    if not isinstance(payload, dict):
+        return None, f"industry provider cache skipped: {path} invalid payload"
+    if (
+        payload.get("schema") != _AKSHARE_BOARD_CACHE_SCHEMA
+        or payload.get("provider") != "akshare"
+        or int(payload.get("max_boards", 0) or 0) != int(max_boards)
+    ):
+        return None, f"industry provider cache skipped: {path} schema mismatch"
+    mapping = _normalize_cached_mapping(payload.get("mapping"))
+    if mapping is None:
+        return None, f"industry provider cache skipped: {path} invalid mapping"
+    return mapping, f"industry provider cache hit: {path} rows={len(mapping)}"
+
+
+def _write_akshare_board_cache(
+    path: Path,
+    mapping: dict[str, dict[str, object]],
+    *,
+    max_boards: int,
+) -> str:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema": _AKSHARE_BOARD_CACHE_SCHEMA,
+            "provider": "akshare",
+            "max_boards": int(max_boards),
+            "created_at": datetime.now().isoformat(),
+            "mapping": _json_safe_mapping(mapping),
+        }
+        tmp_path = path.with_name(f".{path.name}.{time.time_ns()}.tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(path)
+        return f"industry provider cache saved: {path} rows={len(mapping)}"
+    except Exception as exc:
+        return f"industry provider cache skipped: {path} error={exc}"
+
+
+def _normalize_cached_mapping(value: object) -> dict[str, dict[str, object]] | None:
+    if not isinstance(value, dict):
+        return None
+    mapping: dict[str, dict[str, object]] = {}
+    for code, raw_item in value.items():
+        normalized = _normalize_code(code)
+        if not normalized or normalized == "000000" or not isinstance(raw_item, dict):
+            continue
+        item: dict[str, object] = {
+            "industry": _safe_text(raw_item.get("industry")),
+            "concepts": _safe_text(raw_item.get("concepts")),
+        }
+        for field in _NUMERIC_FIELDS:
+            parsed = _safe_float(raw_item.get(field))
+            if parsed is not None:
+                item[field] = int(parsed) if field in {"industry_rank", "board_heat_observations"} else parsed
+        for field in _TEXT_FIELDS:
+            text = _safe_text(raw_item.get(field))
+            if text:
+                item[field] = text
+        mapping[normalized] = item
+    return mapping
+
+
+def _json_safe_mapping(mapping: dict[str, dict[str, object]]) -> dict[str, dict[str, object]]:
+    return {
+        code: _json_safe_item(item)
+        for code, item in sorted(mapping.items())
+        if isinstance(item, dict)
+    }
+
+
+def _json_safe_item(item: dict[str, object]) -> dict[str, object]:
+    cleaned: dict[str, object] = {
+        "industry": _safe_text(item.get("industry")),
+        "concepts": _safe_text(item.get("concepts")),
+    }
+    for field in _NUMERIC_FIELDS:
+        value = _safe_float(item.get(field))
+        if value is not None:
+            cleaned[field] = int(value) if field in {"industry_rank", "board_heat_observations"} else value
+    for field in _TEXT_FIELDS:
+        text = _safe_text(item.get(field))
+        if text:
+            cleaned[field] = text
+    return cleaned
 
 
 def _board_names(df: pd.DataFrame) -> list[str]:
@@ -480,33 +768,6 @@ def _first_row_value(row: dict | pd.Series, columns: list[str]) -> object:
     return None
 
 
-def _normalize_code(value: object) -> str:
-    text = _safe_text(value)
-    if not text:
-        return ""
-    if text.endswith(".0") and text[:-2].isdigit():
-        text = text[:-2]
-    if text.isdigit():
-        return text.zfill(6)[-6:]
-    match = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
-    if match:
-        return match.group(1)
-    digits = "".join(ch for ch in text if ch.isdigit())
-    return digits.zfill(6)[-6:] if digits else ""
-
-
-def _safe_float(value: object) -> float | None:
-    if value is None:
-        return None
-    text = str(value).strip().replace("%", "").replace(",", "")
-    if not text or text.lower() in {"nan", "none", "<na>", "--"}:
-        return None
-    try:
-        return float(text)
-    except (TypeError, ValueError):
-        return None
-
-
 def _max_numeric(left: object, right: object) -> float | None:
     left_num = _safe_float(left)
     right_num = _safe_float(right)
@@ -566,12 +827,3 @@ def _board_heat_summary(board: str, *, change_pct: float | None, rank: float | N
     if rank is not None:
         parts.append(f"rank={int(rank)}")
     return ":".join(parts)
-
-
-def _safe_text(value: object) -> str:
-    if value is None:
-        return ""
-    text = str(value).strip()
-    if text.lower() in {"nan", "none", "<na>"}:
-        return ""
-    return text

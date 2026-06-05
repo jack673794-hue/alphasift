@@ -1,3 +1,6 @@
+import json
+import os
+
 import pandas as pd
 import pytest
 
@@ -134,6 +137,123 @@ def test_fetch_snapshot_with_fallback_skips_missing_required_columns(monkeypatch
         "missing_pb: missing required columns pb_ratio"
     ]
     assert df.loc[0, "pb_ratio"] == 0.8
+
+
+def test_fetch_snapshot_with_fallback_saves_last_good_cache_on_live_success(
+    monkeypatch,
+    tmp_path,
+):
+    cache_path = tmp_path / "snapshot.last_good.json"
+
+    def fake_fetch(source):
+        df = pd.DataFrame([{
+            "code": "000001",
+            "name": "示例",
+            "price": 10.0,
+            "pb_ratio": 0.8,
+        }])
+        df.attrs["snapshot_source"] = source
+        return df
+
+    monkeypatch.setattr("alphasift.snapshot.fetch_cn_snapshot", fake_fetch)
+
+    df = fetch_snapshot_with_fallback(
+        ["good"],
+        required_columns=["price", "pb_ratio"],
+        fallback_snapshot_path=cache_path,
+    )
+
+    assert df.attrs["snapshot_source"] == "good"
+    assert df.attrs["fallback_used"] is False
+    assert cache_path.is_file()
+    payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert payload["metadata"]["snapshot_source"] == "good"
+    assert payload["metadata"]["row_count"] == 1
+
+    monkeypatch.setattr(
+        "alphasift.snapshot.fetch_cn_snapshot",
+        lambda source: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+
+    cached = fetch_snapshot_with_fallback(
+        ["good"],
+        required_columns=["price", "pb_ratio"],
+        fallback_snapshot_path=cache_path,
+    )
+
+    assert cached.loc[0, "code"] == "000001"
+    assert cached.loc[0, "pb_ratio"] == 0.8
+
+
+def test_fetch_snapshot_with_fallback_uses_last_good_cache_after_all_sources_fail(
+    monkeypatch,
+    tmp_path,
+):
+    cache_path = tmp_path / "snapshot.last_good.json"
+    live = pd.DataFrame([{
+        "code": "000001",
+        "name": "示例",
+        "price": 10.0,
+        "pb_ratio": 0.8,
+    }])
+    live.attrs["snapshot_source"] = "good"
+    monkeypatch.setattr("alphasift.snapshot.fetch_cn_snapshot", lambda source: live)
+    fetch_snapshot_with_fallback(
+        ["good"],
+        required_columns=["price", "pb_ratio"],
+        fallback_snapshot_path=cache_path,
+    )
+
+    def fail(source):
+        raise RuntimeError(f"{source} unavailable")
+
+    monkeypatch.setattr("alphasift.snapshot.fetch_cn_snapshot", fail)
+
+    cached = fetch_snapshot_with_fallback(
+        ["efinance", "akshare_em"],
+        required_columns=["price", "pb_ratio"],
+        fallback_snapshot_path=cache_path,
+    )
+
+    assert cached.attrs["snapshot_source"] == "last_good_cache"
+    assert cached.attrs["fallback_used"] is True
+    assert cached.attrs["source_errors"] == [
+        "efinance: efinance unavailable",
+        "akshare_em: akshare_em unavailable",
+    ]
+    assert cached.loc[0, "code"] == "000001"
+
+
+def test_snapshot_fallback_marks_stale_source_metadata(monkeypatch, tmp_path):
+    cache_path = tmp_path / "snapshot.last_good.json"
+    live = pd.DataFrame([{
+        "code": "000001",
+        "name": "示例",
+        "price": 10.0,
+    }])
+    live.attrs["snapshot_source"] = "good"
+    monkeypatch.setattr("alphasift.snapshot.fetch_cn_snapshot", lambda source: live)
+    fetch_snapshot_with_fallback(["good"], fallback_snapshot_path=cache_path)
+
+    old_mtime = cache_path.stat().st_mtime - (3 * 3600)
+    cache_path.touch()
+    os.utime(cache_path, (old_mtime, old_mtime))
+
+    monkeypatch.setattr(
+        "alphasift.snapshot.fetch_cn_snapshot",
+        lambda source: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+
+    cached = fetch_snapshot_with_fallback(
+        ["efinance"],
+        fallback_snapshot_path=cache_path,
+    )
+
+    assert cached.attrs["snapshot_source"] == "last_good_cache"
+    assert cached.attrs["fallback_used"] is True
+    assert cached.attrs["stale"] is True
+    assert cached.attrs["stale_age_hours"] == pytest.approx(3.0, abs=0.1)
+    assert cached.attrs["source_errors"] == ["efinance: offline"]
 
 
 def test_fetch_snapshot_with_fallback_raises_all_errors(monkeypatch):

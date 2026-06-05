@@ -41,49 +41,51 @@ def apply_hard_filters(df: pd.DataFrame, filters: HardFilterConfig) -> pd.DataFr
     if result.empty:
         return result
 
+    mask = pd.Series(True, index=result.index)
+
     if filters.exclude_st:
-        name_col = _find_col(result, ["name", "股票名称", "名称"])
+        name_col = _find_col(result, ["name", "股票名称", "名称"]) if mask.any() else None
         if not name_col:
             raise SnapshotFieldMissingError(
                 "Missing required snapshot column for exclude_st filter: name"
             )
-        result = result[~result[name_col].str.contains(r"ST|退", na=False)]
+        mask &= ~result[name_col].str.contains(r"ST|退", na=False)
 
     # Numeric filters — each is optional
-    _filter_min(result, ["amount", "成交额"], filters.amount_min)
-    _filter_min(result, ["price", "最新价", "现价"], filters.price_min)
-    _filter_max(result, ["price", "最新价", "现价"], filters.price_max)
-    _filter_min(result, ["total_mv", "总市值"], filters.market_cap_min)
-    _filter_max(result, ["total_mv", "总市值"], filters.market_cap_max)
-    _filter_min(result, ["pe_ratio", "市盈率"], filters.pe_ttm_min)
-    _filter_max(result, ["pe_ratio", "市盈率"], filters.pe_ttm_max)
-    _filter_min(result, ["pb_ratio", "市净率"], filters.pb_min)
-    _filter_max(result, ["pb_ratio", "市净率"], filters.pb_max)
-    _filter_min(result, ["volume_ratio", "量比"], filters.volume_ratio_min)
-    _filter_min(result, ["turnover_rate", "换手率"], filters.turnover_rate_min)
-    _filter_min(result, ["change_pct", "涨跌幅"], filters.change_pct_min)
-    _filter_max(result, ["change_pct", "涨跌幅"], filters.change_pct_max)
+    mask = _filter_min(result, mask, ["amount", "成交额"], filters.amount_min)
+    mask = _filter_min(result, mask, ["price", "最新价", "现价"], filters.price_min)
+    mask = _filter_max(result, mask, ["price", "最新价", "现价"], filters.price_max)
+    mask = _filter_min(result, mask, ["total_mv", "总市值"], filters.market_cap_min)
+    mask = _filter_max(result, mask, ["total_mv", "总市值"], filters.market_cap_max)
+    mask = _filter_min(result, mask, ["pe_ratio", "市盈率"], filters.pe_ttm_min)
+    mask = _filter_max(result, mask, ["pe_ratio", "市盈率"], filters.pe_ttm_max)
+    mask = _filter_min(result, mask, ["pb_ratio", "市净率"], filters.pb_min)
+    mask = _filter_max(result, mask, ["pb_ratio", "市净率"], filters.pb_max)
+    mask = _filter_min(result, mask, ["volume_ratio", "量比"], filters.volume_ratio_min)
+    mask = _filter_min(result, mask, ["turnover_rate", "换手率"], filters.turnover_rate_min)
+    mask = _filter_min(result, mask, ["change_pct", "涨跌幅"], filters.change_pct_min)
+    mask = _filter_max(result, mask, ["change_pct", "涨跌幅"], filters.change_pct_max)
 
-    _filter_min(result, ["change_60d"], filters.change_60d_min)
-    _filter_max(result, ["change_60d"], filters.change_60d_max)
-    _filter_bool_true(result, "ma_bullish", filters.require_ma_bullish)
-    _filter_bool_true(result, "price_above_ma20", filters.require_price_above_ma20)
-    _filter_min(result, ["signal_score"], filters.signal_score_min)
-    _filter_in(result, "macd_status", filters.macd_status_whitelist)
-    _filter_in(result, "rsi_status", filters.rsi_status_whitelist)
-    _filter_min(result, ["breakout_20d_pct"], filters.breakout_20d_pct_min)
-    _filter_max(result, ["breakout_20d_pct"], filters.breakout_20d_pct_max)
-    _filter_max(result, ["range_20d_pct"], filters.range_20d_pct_max)
-    _filter_min(result, ["volume_ratio_20d"], filters.volume_ratio_20d_min)
-    _filter_max(result, ["volume_ratio_20d"], filters.volume_ratio_20d_max)
-    _filter_min(result, ["body_pct"], filters.body_pct_min)
-    _filter_max(result, ["body_pct"], filters.body_pct_max)
-    _filter_min(result, ["pullback_to_ma20_pct"], filters.pullback_to_ma20_pct_min)
-    _filter_max(result, ["pullback_to_ma20_pct"], filters.pullback_to_ma20_pct_max)
-    _filter_min(result, ["consolidation_days_20d"], filters.consolidation_days_20d_min)
-    _filter_max(result, ["consolidation_days_20d"], filters.consolidation_days_20d_max)
+    mask = _filter_min(result, mask, ["change_60d"], filters.change_60d_min)
+    mask = _filter_max(result, mask, ["change_60d"], filters.change_60d_max)
+    mask = _filter_bool_true(result, mask, "ma_bullish", filters.require_ma_bullish)
+    mask = _filter_bool_true(result, mask, "price_above_ma20", filters.require_price_above_ma20)
+    mask = _filter_min(result, mask, ["signal_score"], filters.signal_score_min)
+    mask = _filter_in(result, mask, "macd_status", filters.macd_status_whitelist)
+    mask = _filter_in(result, mask, "rsi_status", filters.rsi_status_whitelist)
+    mask = _filter_min(result, mask, ["breakout_20d_pct"], filters.breakout_20d_pct_min)
+    mask = _filter_max(result, mask, ["breakout_20d_pct"], filters.breakout_20d_pct_max)
+    mask = _filter_max(result, mask, ["range_20d_pct"], filters.range_20d_pct_max)
+    mask = _filter_min(result, mask, ["volume_ratio_20d"], filters.volume_ratio_20d_min)
+    mask = _filter_max(result, mask, ["volume_ratio_20d"], filters.volume_ratio_20d_max)
+    mask = _filter_min(result, mask, ["body_pct"], filters.body_pct_min)
+    mask = _filter_max(result, mask, ["body_pct"], filters.body_pct_max)
+    mask = _filter_min(result, mask, ["pullback_to_ma20_pct"], filters.pullback_to_ma20_pct_min)
+    mask = _filter_max(result, mask, ["pullback_to_ma20_pct"], filters.pullback_to_ma20_pct_max)
+    mask = _filter_min(result, mask, ["consolidation_days_20d"], filters.consolidation_days_20d_min)
+    mask = _filter_max(result, mask, ["consolidation_days_20d"], filters.consolidation_days_20d_max)
 
-    return result
+    return result.loc[mask].copy()
 
 
 def requires_daily_features(filters: HardFilterConfig) -> bool:
@@ -122,11 +124,16 @@ def _find_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     return None
 
 
-def _filter_min(df: pd.DataFrame, col_names: list[str], value: float | None) -> None:
+def _filter_min(
+    df: pd.DataFrame,
+    mask: pd.Series,
+    col_names: list[str],
+    value: float | None,
+) -> pd.Series:
     if value is None:
-        return
-    if df.empty:
-        return
+        return mask
+    if not mask.any():
+        return mask
     col = _find_col(df, col_names)
     if not col:
         raise SnapshotFieldMissingError(
@@ -134,14 +141,19 @@ def _filter_min(df: pd.DataFrame, col_names: list[str], value: float | None) -> 
             f"configured value={value}"
         )
     series = pd.to_numeric(df[col], errors="coerce")
-    df.drop(df[(series < value) | series.isna()].index, inplace=True)
+    return mask & series.ge(value) & series.notna()
 
 
-def _filter_max(df: pd.DataFrame, col_names: list[str], value: float | None) -> None:
+def _filter_max(
+    df: pd.DataFrame,
+    mask: pd.Series,
+    col_names: list[str],
+    value: float | None,
+) -> pd.Series:
     if value is None:
-        return
-    if df.empty:
-        return
+        return mask
+    if not mask.any():
+        return mask
     col = _find_col(df, col_names)
     if not col:
         raise SnapshotFieldMissingError(
@@ -149,29 +161,39 @@ def _filter_max(df: pd.DataFrame, col_names: list[str], value: float | None) -> 
             f"configured value={value}"
         )
     series = pd.to_numeric(df[col], errors="coerce")
-    df.drop(df[(series > value) | series.isna()].index, inplace=True)
+    return mask & series.le(value) & series.notna()
 
 
-def _filter_bool_true(df: pd.DataFrame, col_name: str, enabled: bool) -> None:
+def _filter_bool_true(
+    df: pd.DataFrame,
+    mask: pd.Series,
+    col_name: str,
+    enabled: bool,
+) -> pd.Series:
     if not enabled:
-        return
-    if df.empty:
-        return
+        return mask
+    if not mask.any():
+        return mask
     if col_name not in df.columns:
         raise SnapshotFieldMissingError(
             f"Missing required daily feature column for bool filter: {col_name}"
         )
-    df.drop(df[df[col_name] != True].index, inplace=True)  # noqa: E712
+    return mask & (df[col_name] == True)  # noqa: E712
 
 
-def _filter_in(df: pd.DataFrame, col_name: str, allowed: list[str] | None) -> None:
+def _filter_in(
+    df: pd.DataFrame,
+    mask: pd.Series,
+    col_name: str,
+    allowed: list[str] | None,
+) -> pd.Series:
     if not allowed:
-        return
-    if df.empty:
-        return
+        return mask
+    if not mask.any():
+        return mask
     if col_name not in df.columns:
         raise SnapshotFieldMissingError(
             f"Missing required daily feature column for whitelist filter: {col_name}"
         )
     allowed_set = {str(item) for item in allowed}
-    df.drop(df[~df[col_name].astype(str).isin(allowed_set)].index, inplace=True)
+    return mask & df[col_name].astype(str).isin(allowed_set)

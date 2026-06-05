@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+import hashlib
+import json
+from pathlib import Path
 import time
 
 import pandas as pd
@@ -28,6 +32,9 @@ _DAILY_FEATURE_DEFAULTS = {
     "pullback_to_ma20_pct": pd.NA,
     "consolidation_days_20d": pd.NA,
 }
+_DAILY_ENRICH_MAX_WORKERS = 8
+_DAILY_HISTORY_CACHE_VERSION = 1
+_DAILY_HISTORY_CACHE_TTL_SECONDS = 24 * 60 * 60
 
 
 def enrich_daily_features(
@@ -37,6 +44,8 @@ def enrich_daily_features(
     lookback_days: int = 120,
     source: str = "akshare",
     fetch_retries: int = 2,
+    cache_dir: str | Path | None = None,
+    cache_ttl_seconds: float | None = None,
 ) -> pd.DataFrame:
     """Attach daily technical features to the first ``max_rows`` candidates.
 
@@ -50,23 +59,41 @@ def enrich_daily_features(
     daily_errors: list[str] = []
     success_count = 0
     selected_index = list(result.index[:max_rows])
+    fetch_requests: list[tuple[object, str]] = []
     for idx in selected_index:
         raw_code = str(result.at[idx, "code"] if "code" in result.columns else "").strip()
         if not raw_code:
             continue
         code = raw_code.zfill(6)
+        fetch_requests.append((idx, code))
+
+    def fetch_one(request: tuple[object, str]) -> tuple[object, dict[str, object], str | None]:
+        idx, code = request
         try:
             hist = fetch_daily_history(
                 code,
                 lookback_days=lookback_days,
                 source=source,
                 retries=fetch_retries,
+                cache_dir=cache_dir,
+                cache_ttl_seconds=cache_ttl_seconds,
             )
-            features = compute_daily_features(hist)
-            success_count += 1
+            return idx, compute_daily_features(hist), None
         except Exception as exc:
-            daily_errors.append(f"{code}: {exc}")
-            features = dict(_DAILY_FEATURE_DEFAULTS)
+            return idx, dict(_DAILY_FEATURE_DEFAULTS), f"{code}: {exc}"
+
+    if len(fetch_requests) <= 1:
+        fetched_rows = [fetch_one(request) for request in fetch_requests]
+    else:
+        max_workers = min(_DAILY_ENRICH_MAX_WORKERS, len(fetch_requests))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            fetched_rows = list(executor.map(fetch_one, fetch_requests))
+
+    for idx, features, error in fetched_rows:
+        if error:
+            daily_errors.append(error)
+        else:
+            success_count += 1
         for key, value in features.items():
             result.at[idx, key] = value
 
@@ -81,6 +108,8 @@ def fetch_daily_history(
     lookback_days: int = 120,
     source: str = "akshare",
     retries: int = 2,
+    cache_dir: str | Path | None = None,
+    cache_ttl_seconds: float | None = None,
 ) -> pd.DataFrame:
     """Fetch daily history for one A-share code.
 
@@ -89,13 +118,27 @@ def fetch_daily_history(
     matches the multi-source resilience pattern recommended for A-share data
     pipelines (DSA-style: free primary + free backup).
     """
-    src = (source or "akshare").lower()
+    normalized_code = _normalize_daily_code(code)
+    normalized_lookback_days = int(lookback_days)
+    src = _normalize_daily_source(source)
     if src == "auto":
         sources: tuple[str, ...] = ("akshare", "baostock")
     elif src in ("akshare", "baostock"):
         sources = (src,)
     else:
         raise ValueError(f"Unsupported daily source: {source}")
+
+    cache_path = None
+    if cache_dir is not None:
+        cache_path = _daily_history_cache_path(
+            cache_dir,
+            code=normalized_code,
+            source=src,
+            lookback_days=normalized_lookback_days,
+        )
+        cached = _read_daily_history_cache(cache_path, ttl_seconds=cache_ttl_seconds)
+        if cached is not None:
+            return cached
 
     attempts = max(int(retries), 0) + 1
     errors: list[str] = []
@@ -104,8 +147,24 @@ def fetch_daily_history(
         for attempt in range(attempts):
             try:
                 if current == "akshare":
-                    return _fetch_daily_akshare(code, lookback_days=lookback_days)
-                return _fetch_daily_baostock(code, lookback_days=lookback_days)
+                    result = _fetch_daily_akshare(
+                        normalized_code,
+                        lookback_days=normalized_lookback_days,
+                    )
+                else:
+                    result = _fetch_daily_baostock(
+                        normalized_code,
+                        lookback_days=normalized_lookback_days,
+                    )
+                if cache_path is not None:
+                    _write_daily_history_cache(
+                        cache_path,
+                        result,
+                        code=normalized_code,
+                        source=src,
+                        lookback_days=normalized_lookback_days,
+                    )
+                return result
             except Exception as exc:  # noqa: BLE001 - aggregated below
                 last_error = exc
                 if attempt >= attempts - 1:
@@ -114,8 +173,95 @@ def fetch_daily_history(
         errors.append(f"{current} after {attempts} attempts: {last_error}")
 
     raise RuntimeError(
-        f"daily history fetch failed for {code}: {'; '.join(errors)}"
+        f"daily history fetch failed for {normalized_code}: {'; '.join(errors)}"
     )
+
+
+def _normalize_daily_code(value: object) -> str:
+    text = "" if value is None else str(value).strip()
+    if not text or text.lower() in {"nan", "none", "<na>"}:
+        return ""
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    if text.isdigit():
+        return text.zfill(6)[-6:]
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return digits.zfill(6)[-6:] if digits else text
+
+
+def _normalize_daily_source(source: str | None) -> str:
+    return (source or "akshare").strip().lower()
+
+
+def _daily_history_cache_path(
+    cache_dir: str | Path,
+    *,
+    code: str,
+    source: str,
+    lookback_days: int,
+) -> Path:
+    key = f"{code}|{source}|{int(lookback_days)}"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    safe_source = "".join(ch if ch.isalnum() else "-" for ch in source).strip("-") or "source"
+    safe_code = "".join(ch if ch.isalnum() else "-" for ch in code).strip("-") or "code"
+    return Path(cache_dir) / f"{safe_code}_{safe_source}_{int(lookback_days)}_{digest}.json"
+
+
+def _read_daily_history_cache(
+    path: Path,
+    *,
+    ttl_seconds: float | None,
+) -> pd.DataFrame | None:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+
+    ttl = _DAILY_HISTORY_CACHE_TTL_SECONDS if ttl_seconds is None else float(ttl_seconds)
+    if ttl <= 0 or time.time() - stat.st_mtime > ttl:
+        return None
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("version") != _DAILY_HISTORY_CACHE_VERSION:
+            return None
+        frame = payload.get("frame")
+        if not isinstance(frame, dict):
+            return None
+        columns = frame.get("columns")
+        data = frame.get("data")
+        if not isinstance(columns, list) or not isinstance(data, list):
+            return None
+        return pd.DataFrame(data, columns=columns)
+    except Exception:
+        return None
+
+
+def _write_daily_history_cache(
+    path: Path,
+    df: pd.DataFrame,
+    *,
+    code: str,
+    source: str,
+    lookback_days: int,
+) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": _DAILY_HISTORY_CACHE_VERSION,
+            "key": {
+                "code": code,
+                "source": source,
+                "lookback_days": int(lookback_days),
+            },
+            "created_at": datetime.now().isoformat(),
+            "frame": json.loads(df.to_json(orient="split", date_format="iso", force_ascii=False)),
+        }
+        tmp_path = path.with_name(f".{path.name}.{time.time_ns()}.tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp_path.replace(path)
+    except Exception:
+        return
 
 
 def _fetch_daily_akshare(code: str, *, lookback_days: int) -> pd.DataFrame:

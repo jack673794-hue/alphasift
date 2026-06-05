@@ -1,3 +1,7 @@
+import os
+import threading
+import time
+
 import pandas as pd
 import pytest
 
@@ -67,6 +71,104 @@ def test_fetch_daily_history_reports_retry_count(monkeypatch):
         fetch_daily_history("000001", retries=1)
 
 
+def test_fetch_daily_history_uses_cache_until_ttl(tmp_path, monkeypatch):
+    calls = {"count": 0}
+
+    class FakeAkshare:
+        @staticmethod
+        def stock_zh_a_hist(**kwargs):
+            calls["count"] += 1
+            return pd.DataFrame({
+                "日期": pd.date_range("2026-01-01", periods=40).astype(str),
+                "收盘": [10 + calls["count"]] * 40,
+            })
+
+    monkeypatch.setitem(__import__("sys").modules, "akshare", FakeAkshare)
+
+    first = fetch_daily_history(
+        "SZ000001",
+        lookback_days=45,
+        source="akshare",
+        retries=0,
+        cache_dir=tmp_path / "daily_history",
+        cache_ttl_seconds=3600,
+    )
+    second = fetch_daily_history(
+        "1",
+        lookback_days=45,
+        source="AKSHARE",
+        retries=0,
+        cache_dir=tmp_path / "daily_history",
+        cache_ttl_seconds=3600,
+    )
+
+    assert calls["count"] == 1
+    assert list(first["收盘"]) == list(second["收盘"])
+    assert len(list((tmp_path / "daily_history").glob("*.json"))) == 1
+
+
+def test_fetch_daily_history_refetches_after_cache_expiry(tmp_path, monkeypatch):
+    calls = {"count": 0}
+
+    class FakeAkshare:
+        @staticmethod
+        def stock_zh_a_hist(**kwargs):
+            calls["count"] += 1
+            return pd.DataFrame({
+                "日期": pd.date_range("2026-01-01", periods=40).astype(str),
+                "收盘": [10 + calls["count"]] * 40,
+            })
+
+    monkeypatch.setitem(__import__("sys").modules, "akshare", FakeAkshare)
+    cache_dir = tmp_path / "daily_history"
+
+    first = fetch_daily_history(
+        "000001",
+        lookback_days=45,
+        source="akshare",
+        retries=0,
+        cache_dir=cache_dir,
+        cache_ttl_seconds=60,
+    )
+    cache_file = next(cache_dir.glob("*.json"))
+    expired = time.time() - 120
+    os.utime(cache_file, (expired, expired))
+    second = fetch_daily_history(
+        "000001",
+        lookback_days=45,
+        source="akshare",
+        retries=0,
+        cache_dir=cache_dir,
+        cache_ttl_seconds=60,
+    )
+
+    assert calls["count"] == 2
+    assert first["收盘"].iloc[-1] == 11
+    assert second["收盘"].iloc[-1] == 12
+
+
+def test_fetch_daily_history_without_cache_dir_preserves_live_fetch(monkeypatch):
+    calls = {"count": 0}
+
+    class FakeAkshare:
+        @staticmethod
+        def stock_zh_a_hist(**kwargs):
+            calls["count"] += 1
+            return pd.DataFrame({
+                "日期": pd.date_range("2026-01-01", periods=40).astype(str),
+                "收盘": [10 + calls["count"]] * 40,
+            })
+
+    monkeypatch.setitem(__import__("sys").modules, "akshare", FakeAkshare)
+
+    first = fetch_daily_history("000001", retries=0)
+    second = fetch_daily_history("000001", retries=0)
+
+    assert calls["count"] == 2
+    assert first["收盘"].iloc[-1] == 11
+    assert second["收盘"].iloc[-1] == 12
+
+
 def test_enrich_daily_features_keeps_successful_rows_when_one_fetch_fails(monkeypatch):
     candidates = pd.DataFrame([
         {"code": "000001", "name": "平安银行"},
@@ -90,6 +192,57 @@ def test_enrich_daily_features_keeps_successful_rows_when_one_fetch_fails(monkey
     assert "600000" in result.attrs["daily_errors"][0]
     assert result.loc[0, "daily_data_points"] == 80
     assert pd.isna(result.loc[1, "daily_data_points"])
+
+
+def test_enrich_daily_features_fetches_rows_concurrently_preserving_index(monkeypatch):
+    candidates = pd.DataFrame(
+        [
+            {"code": "000003", "name": "招商银行"},
+            {"code": "000001", "name": "平安银行"},
+            {"code": "600000", "name": "浦发银行"},
+        ],
+        index=["row_c", "row_a", "row_b"],
+    )
+    candidates.attrs["snapshot_source"] = "test"
+    candidates.attrs["source_errors"] = ["primary fallback"]
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+    overlap_seen = threading.Event()
+
+    def fake_fetch_daily_history(code, **kwargs):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+            if active >= 2:
+                overlap_seen.set()
+        try:
+            overlap_seen.wait(timeout=0.25)
+            return pd.DataFrame({"code": [code]})
+        finally:
+            with lock:
+                active -= 1
+
+    def fake_compute_daily_features(hist):
+        code = str(hist.loc[0, "code"])
+        return {"daily_data_points": int(code[-1]), "signal_score": int(code[-1]) * 10}
+
+    monkeypatch.setattr("alphasift.daily.fetch_daily_history", fake_fetch_daily_history)
+    monkeypatch.setattr("alphasift.daily.compute_daily_features", fake_compute_daily_features)
+
+    result = enrich_daily_features(candidates, max_rows=3)
+
+    assert max_active >= 2
+    assert list(result.index) == ["row_c", "row_a", "row_b"]
+    assert list(result["code"]) == ["000003", "000001", "600000"]
+    assert result.loc["row_c", "daily_data_points"] == 3
+    assert result.loc["row_a", "daily_data_points"] == 1
+    assert result.loc["row_b", "daily_data_points"] == 0
+    assert result.attrs["snapshot_source"] == "test"
+    assert result.attrs["source_errors"] == ["primary fallback"]
+    assert result.attrs["daily_success_count"] == 3
+    assert result.attrs["daily_errors"] == []
 
 
 def test_to_baostock_code_handles_main_boards():

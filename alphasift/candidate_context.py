@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -40,6 +41,7 @@ _SOURCE_WEIGHTS = {
     "news": 0.65,
     "fund_flow": 0.75,
 }
+_DEFAULT_MAX_WORKERS = 4
 
 
 def collect_candidate_context(
@@ -63,12 +65,81 @@ def collect_candidate_context(
         return [], []
 
     providers = _normalize_providers(providers or [])
-    rows: list[dict[str, object]] = []
-    errors: list[str] = []
+    tasks: list[dict[str, str]] = []
     for _, candidate in candidate_df.head(max_rows).iterrows():
         code = _normalize_code(candidate.get("code", ""))
         if not code or code == "000000":
             continue
+        tasks.append(
+            {
+                "code": code,
+                "name": str(candidate.get("name", "") or ""),
+            }
+        )
+
+    if not tasks:
+        return [], []
+
+    results: list[tuple[dict[str, object] | None, list[str]] | None] = [None] * len(tasks)
+    max_workers = min(_DEFAULT_MAX_WORKERS, len(tasks))
+    if max_workers <= 1:
+        for index, task in enumerate(tasks):
+            results[index] = _collect_candidate_context_row(
+                task,
+                providers=providers,
+                news_limit=news_limit,
+                announcement_limit=announcement_limit,
+                cache_dir=cache_dir,
+                cache_ttl_hours=cache_ttl_hours,
+                source_weights=source_weights,
+            )
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_index = {
+                executor.submit(
+                    _collect_candidate_context_row,
+                    task,
+                    providers=providers,
+                    news_limit=news_limit,
+                    announcement_limit=announcement_limit,
+                    cache_dir=cache_dir,
+                    cache_ttl_hours=cache_ttl_hours,
+                    source_weights=source_weights,
+                ): index
+                for index, task in enumerate(tasks)
+            }
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                try:
+                    results[index] = future.result()
+                except Exception as exc:
+                    results[index] = (None, [f"{tasks[index]['code']} context: {exc}"])
+
+    rows: list[dict[str, object]] = []
+    errors: list[str] = []
+    for result in results:
+        if result is None:
+            continue
+        row, row_errors = result
+        errors.extend(row_errors)
+        if row is not None:
+            rows.append(row)
+    return rows, errors
+
+
+def _collect_candidate_context_row(
+    candidate: dict[str, str],
+    *,
+    providers: list[str],
+    news_limit: int,
+    announcement_limit: int,
+    cache_dir: str | Path | None,
+    cache_ttl_hours: int,
+    source_weights: dict[str, float] | None,
+) -> tuple[dict[str, object] | None, list[str]]:
+    code = candidate["code"]
+    errors: list[str] = []
+    try:
         cached = _read_cache(cache_dir, code, providers, cache_ttl_hours=cache_ttl_hours)
         if cached is not None:
             _ensure_context_row_enrichment(
@@ -76,11 +147,10 @@ def collect_candidate_context(
                 requested_sources=providers,
                 source_weights=source_weights,
             )
-            rows.append(cached)
-            continue
+            return cached, []
         row: dict[str, object] = {
             "code": code,
-            "name": str(candidate.get("name", "") or ""),
+            "name": candidate.get("name", ""),
         }
         successful_sources: list[str] = []
         if "news" in providers:
@@ -118,9 +188,14 @@ def collect_candidate_context(
                 successful_sources=successful_sources,
                 source_weights=source_weights,
             )
-            rows.append(row)
-            _write_cache(cache_dir, code, providers, row)
-    return rows, errors
+            try:
+                _write_cache(cache_dir, code, providers, row)
+            except Exception as exc:
+                errors.append(f"{code} cache: {exc}")
+            return row, errors
+        return None, errors
+    except Exception as exc:
+        return None, [*errors, f"{code} context: {exc}"]
 
 
 def fetch_stock_news_summary(code: str, *, limit: int = 3) -> str:

@@ -6,12 +6,17 @@ This is separate from single-stock realtime quotes.
 """
 
 import logging
+import json
 import os
-from datetime import date, timedelta
+import time
+from datetime import date, datetime, timezone, timedelta
+from pathlib import Path
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+_SNAPSHOT_CACHE_VERSION = 1
 
 
 def fetch_cn_snapshot(source: str = "efinance") -> pd.DataFrame:
@@ -39,26 +44,42 @@ def fetch_snapshot_with_fallback(
     sources: list[str],
     *,
     required_columns: list[str] | None = None,
+    fallback_snapshot_path: str | Path | None = None,
 ) -> pd.DataFrame:
-    """Try sources in order, return first source matching required schema."""
+    """Try live sources, optionally falling back to the last-good snapshot."""
     errors = []
+    required = required_columns or []
     for source in sources:
         try:
             df = fetch_cn_snapshot(source)
             if not df.empty:
-                missing = _missing_required_columns(df, required_columns or [])
+                missing = _missing_required_columns(df, required)
                 if missing:
                     errors.append(
                         f"{source}: missing required columns {','.join(missing)}"
                     )
                     continue
+                df.attrs.setdefault("snapshot_source", source)
                 df.attrs["source_errors"] = list(errors)
+                df.attrs["fallback_used"] = False
+                df.attrs["stale"] = False
+                df.attrs["stale_age_hours"] = None
+                _write_last_good_snapshot(fallback_snapshot_path, df)
                 logger.info("Snapshot fetched from %s: %d rows", source, len(df))
                 return df
             errors.append(f"{source}: returned empty data")
         except Exception as e:
             errors.append(f"{source}: {e}")
             logger.warning("Snapshot source %s failed: %s", source, e)
+
+    cached = _read_last_good_snapshot(
+        fallback_snapshot_path,
+        required_columns=required,
+        source_errors=errors,
+    )
+    if cached is not None:
+        return cached
+
     raise RuntimeError(f"All snapshot sources failed: {'; '.join(errors)}")
 
 
@@ -71,6 +92,94 @@ def _missing_required_columns(df: pd.DataFrame, required_columns: list[str]) -> 
         if df[col].dropna().empty:
             missing.append(col)
     return missing
+
+
+def _write_last_good_snapshot(
+    path_like: str | Path | None,
+    df: pd.DataFrame,
+) -> None:
+    if path_like is None:
+        return
+    path = Path(path_like)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": _SNAPSHOT_CACHE_VERSION,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "metadata": {
+                "snapshot_source": str(df.attrs.get("snapshot_source", "")),
+                "row_count": int(len(df)),
+                "columns": list(df.columns),
+            },
+            "frame": json.loads(
+                df.to_json(orient="split", date_format="iso", force_ascii=False)
+            ),
+        }
+        tmp_path = path.with_name(f".{path.name}.{time.time_ns()}.tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp_path.replace(path)
+    except Exception as exc:  # noqa: BLE001 - live snapshot should remain usable.
+        logger.warning("Failed to write last-good snapshot cache %s: %s", path, exc)
+
+
+def _read_last_good_snapshot(
+    path_like: str | Path | None,
+    *,
+    required_columns: list[str],
+    source_errors: list[str],
+) -> pd.DataFrame | None:
+    if path_like is None:
+        return None
+    path = Path(path_like)
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("version") != _SNAPSHOT_CACHE_VERSION:
+            raise ValueError("unsupported cache version")
+        frame = payload.get("frame")
+        if not isinstance(frame, dict):
+            raise ValueError("missing cached frame")
+        columns = frame.get("columns")
+        data = frame.get("data")
+        if not isinstance(columns, list) or not isinstance(data, list):
+            raise ValueError("malformed cached frame")
+        cached = pd.DataFrame(data, columns=columns)
+        if cached.empty:
+            raise ValueError("cached snapshot is empty")
+        missing = _missing_required_columns(cached, required_columns)
+        if missing:
+            raise ValueError(f"missing required columns {','.join(missing)}")
+    except Exception as exc:  # noqa: BLE001 - invalid cache should not mask live errors.
+        source_errors.append(f"last_good_cache: {exc}")
+        return None
+
+    cached.attrs["snapshot_source"] = "last_good_cache"
+    cached.attrs["fallback_used"] = True
+    cached.attrs["stale"] = True
+    cached.attrs["stale_age_hours"] = _cache_stale_age_hours(stat.st_mtime)
+    cached.attrs["source_errors"] = list(source_errors)
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        cached.attrs["last_good_snapshot_source"] = str(
+            metadata.get("snapshot_source", "")
+        )
+        cached.attrs["last_good_created_at"] = str(payload.get("created_at", ""))
+    logger.warning(
+        "Using last-good snapshot cache %s after live source failures: %s",
+        path,
+        "; ".join(source_errors),
+    )
+    return cached
+
+
+def _cache_stale_age_hours(mtime: float) -> float:
+    modified = datetime.fromtimestamp(mtime, tz=timezone.utc)
+    age_hours = (datetime.now(timezone.utc) - modified).total_seconds() / 3600.0
+    return round(max(age_hours, 0.0), 4)
 
 
 def _fetch_efinance() -> pd.DataFrame:

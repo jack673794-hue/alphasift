@@ -92,6 +92,52 @@ def build_dsa_analyze_url(api_url: str) -> str:
     return f"{stripped}{_DEFAULT_ANALYZE_PATH}"
 
 
+def check_dsa_readiness(api_url: str, *, timeout_sec: float = 5.0) -> dict:
+    """Best-effort DSA endpoint readiness probe for CLI/runtime diagnostics."""
+    if not api_url:
+        return {
+            "available": False,
+            "status": "missing_url",
+            "endpoint": "",
+            "http_status": None,
+            "error": "DSA_API_URL is not configured",
+        }
+
+    endpoint = build_dsa_analyze_url(api_url)
+    try:
+        response = requests.get(endpoint, timeout=timeout_sec)
+    except requests.RequestException as exc:
+        return {
+            "available": False,
+            "status": "unreachable",
+            "endpoint": endpoint,
+            "http_status": None,
+            "error": str(exc),
+        }
+
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if status_code in {200, 204, 405, 422}:
+        status = "route_present"
+        available = True
+    elif status_code in {401, 403}:
+        status = "unauthorized"
+        available = False
+    elif status_code == 404:
+        status = "route_missing"
+        available = False
+    else:
+        status = "unexpected_status"
+        available = False
+
+    return {
+        "available": available,
+        "status": status,
+        "endpoint": endpoint,
+        "http_status": status_code,
+        "error": "" if available else _safe_str(getattr(response, "text", ""))[:280],
+    }
+
+
 def call_dsa_analysis(
     endpoint: str,
     *,

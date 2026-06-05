@@ -1,7 +1,9 @@
+import os
 from pathlib import Path
 
 import pytest
 
+import alphasift.strategy as strategy_module
 from alphasift.strategy import list_strategies, load_all_strategies, load_strategy
 
 
@@ -53,6 +55,55 @@ def test_load_all_strategies_allows_repo_local_custom_strategy(tmp_path):
     strategies = load_all_strategies(tmp_path)
 
     assert "custom_alpha" in strategies
+
+
+def test_load_all_strategies_uses_cache_until_yaml_mtime_changes(tmp_path, monkeypatch):
+    path = tmp_path / "cached_alpha.yaml"
+    path.write_text(
+        "\n".join([
+            "name: cached_alpha",
+            "display_name: 一版",
+            "description: demo",
+            "screening:",
+            "  enabled: true",
+            "  market_scope: [cn]",
+        ]),
+        encoding="utf-8",
+    )
+    calls = {"count": 0}
+    original_load_strategy = strategy_module.load_strategy
+
+    def counting_load_strategy(filepath):
+        calls["count"] += 1
+        return original_load_strategy(filepath)
+
+    monkeypatch.setattr(strategy_module, "load_strategy", counting_load_strategy)
+
+    first = strategy_module.load_all_strategies(tmp_path)
+    second = strategy_module.load_all_strategies(tmp_path)
+
+    assert calls["count"] == 1
+    assert first["cached_alpha"].display_name == "一版"
+    assert second["cached_alpha"].display_name == "一版"
+
+    path.write_text(
+        "\n".join([
+            "name: cached_alpha",
+            "display_name: 二版",
+            "description: demo",
+            "screening:",
+            "  enabled: true",
+            "  market_scope: [cn]",
+        ]),
+        encoding="utf-8",
+    )
+    stat = path.stat()
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+
+    third = strategy_module.load_all_strategies(tmp_path)
+
+    assert calls["count"] == 2
+    assert third["cached_alpha"].display_name == "二版"
 
 
 def test_load_strategy_rejects_unknown_hard_filter_key(tmp_path):

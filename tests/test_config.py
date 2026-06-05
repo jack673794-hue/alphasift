@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from alphasift.config import Config
+from alphasift.config import Config, DEFAULT_LLM_MODEL
 
 
 def test_config_reads_daily_stock_analysis_litellm_env(monkeypatch):
@@ -62,6 +62,60 @@ def test_config_reads_daily_fetch_retries(monkeypatch):
     config = Config.from_env()
 
     assert config.daily_fetch_retries == 4
+
+
+def test_config_defaults_daily_history_cache_under_data_dir(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALPHASIFT_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("ALPHASIFT_FALLBACK_SNAPSHOT_PATH", raising=False)
+    monkeypatch.delenv("FALLBACK_SNAPSHOT_PATH", raising=False)
+    monkeypatch.delenv("ALPHASIFT_DAILY_HISTORY_CACHE_DIR", raising=False)
+    monkeypatch.delenv("ALPHASIFT_DAILY_HISTORY_CACHE_TTL_HOURS", raising=False)
+    monkeypatch.delenv("DAILY_HISTORY_CACHE_TTL_HOURS", raising=False)
+    monkeypatch.delenv("ALPHASIFT_INDUSTRY_PROVIDER_CACHE_DIR", raising=False)
+    monkeypatch.delenv("INDUSTRY_PROVIDER_CACHE_DIR", raising=False)
+    monkeypatch.delenv("ALPHASIFT_INDUSTRY_PROVIDER_CACHE_TTL_HOURS", raising=False)
+    monkeypatch.delenv("INDUSTRY_PROVIDER_CACHE_TTL_HOURS", raising=False)
+
+    config = Config.from_env()
+
+    assert config.daily_history_cache_dir == tmp_path / "daily_history"
+    assert config.daily_history_cache_ttl_hours == 24
+    assert config.industry_provider_cache_dir == tmp_path / "industry_provider_cache"
+    assert config.industry_provider_cache_ttl_hours == 24
+    assert config.fallback_snapshot_path == tmp_path / "snapshot.last_good.json"
+
+
+def test_config_reads_daily_history_cache_env(monkeypatch, tmp_path):
+    cache_dir = tmp_path / "custom-daily-cache"
+    monkeypatch.setenv("ALPHASIFT_DAILY_HISTORY_CACHE_DIR", str(cache_dir))
+    monkeypatch.delenv("ALPHASIFT_DAILY_HISTORY_CACHE_TTL_HOURS", raising=False)
+    monkeypatch.setenv("DAILY_HISTORY_CACHE_TTL_HOURS", "6")
+
+    config = Config.from_env()
+
+    assert config.daily_history_cache_dir == cache_dir
+    assert config.daily_history_cache_ttl_hours == 6
+
+
+def test_config_reads_industry_provider_cache_env(monkeypatch, tmp_path):
+    cache_dir = tmp_path / "custom-industry-provider-cache"
+    monkeypatch.setenv("ALPHASIFT_INDUSTRY_PROVIDER_CACHE_DIR", str(cache_dir))
+    monkeypatch.delenv("ALPHASIFT_INDUSTRY_PROVIDER_CACHE_TTL_HOURS", raising=False)
+    monkeypatch.setenv("INDUSTRY_PROVIDER_CACHE_TTL_HOURS", "7")
+
+    config = Config.from_env()
+
+    assert config.industry_provider_cache_dir == cache_dir
+    assert config.industry_provider_cache_ttl_hours == 7
+
+
+def test_config_reads_fallback_snapshot_path_env(monkeypatch, tmp_path):
+    cache_path = tmp_path / "custom-snapshot.json"
+    monkeypatch.setenv("ALPHASIFT_FALLBACK_SNAPSHOT_PATH", str(cache_path))
+
+    config = Config.from_env()
+
+    assert config.fallback_snapshot_path == cache_path
 
 
 def test_config_prefers_tushare_when_token_is_configured(monkeypatch):
@@ -169,3 +223,51 @@ def test_empty_values_in_extra_env_file_do_not_block_later_files(monkeypatch, tm
     config = Config.from_env()
 
     assert config.llm_api_key == "real-key"
+
+
+def test_config_from_env_loads_env_file_once_per_process(monkeypatch, tmp_path):
+    for name in (
+        "LITELLM_MODEL",
+        "LLM_MODEL",
+        "AGENT_LITELLM_MODEL",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "DEEPSEEK_API_KEY",
+        "GEMINI_API_KEY",
+        "GEMINI_API_KEYS",
+        "OLLAMA_API_BASE",
+        "AIHUBMIX_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    env_file = tmp_path / "cached.env"
+    env_file.write_text(
+        "\n".join([
+            "LITELLM_MODEL=openai/cached-model",
+            "OPENAI_API_KEY=sk-cached",
+        ]),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ALPHASIFT_ENV_FILES", str(env_file))
+    calls = {"count": 0}
+    original_read_text = Path.read_text
+
+    def counting_read_text(self, *args, **kwargs):
+        if self == env_file:
+            calls["count"] += 1
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counting_read_text)
+
+    first = Config.from_env()
+    second = Config.from_env()
+
+    assert calls["count"] == 1
+    assert first.llm_model == "openai/cached-model"
+    assert second.llm_api_key == "sk-cached"
+
+    monkeypatch.delenv("ALPHASIFT_ENV_FILES", raising=False)
+    third = Config.from_env()
+
+    assert os.getenv("LITELLM_MODEL") is None
+    assert os.getenv("OPENAI_API_KEY") is None
+    assert third.llm_model == DEFAULT_LLM_MODEL

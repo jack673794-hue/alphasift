@@ -11,6 +11,8 @@ DEFAULT_POST_ANALYZERS = ["scorecard"]
 DEFAULT_LLM_MODEL = "gemini/gemini-2.5-flash"
 DEFAULT_SNAPSHOT_SOURCE_PRIORITY = ["efinance", "akshare_em", "em_datacenter"]
 TUSHARE_FIRST_SOURCE_PRIORITY = ["tushare", "efinance", "akshare_em", "em_datacenter"]
+_ENV_FILE_CACHE: dict[Path, tuple[tuple[int, int], dict[str, str]]] = {}
+_APPLIED_ENV_FILE_VALUES: dict[str, str] = {}
 
 
 def _load_env_file() -> None:
@@ -21,19 +23,50 @@ def _load_env_file() -> None:
         _PROJECT_ROOT / ".env",
     ]
     seen: set[Path] = set()
+    file_values: dict[str, str] = {}
     for path in candidates:
-        if path in seen or not path.is_file():
+        resolved = path.resolve()
+        if resolved in seen or not path.is_file():
             continue
-        seen.add(path)
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            cleaned = value.strip().strip("'\"")
-            if cleaned == "":
-                continue
-            os.environ.setdefault(key.strip(), cleaned)
+        seen.add(resolved)
+        for key, value in _read_env_file_values(path).items():
+            file_values.setdefault(key, value)
+    _apply_env_file_values(file_values)
+
+
+def _read_env_file_values(path: Path) -> dict[str, str]:
+    resolved = path.resolve()
+    stat = path.stat()
+    signature = (stat.st_mtime_ns, stat.st_size)
+    cached = _ENV_FILE_CACHE.get(resolved)
+    if cached is not None and cached[0] == signature:
+        return dict(cached[1])
+
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        cleaned = value.strip().strip("'\"")
+        if cleaned == "":
+            continue
+        values.setdefault(key.strip(), cleaned)
+    _ENV_FILE_CACHE[resolved] = (signature, dict(values))
+    return values
+
+
+def _apply_env_file_values(file_values: dict[str, str]) -> None:
+    for key, old_value in list(_APPLIED_ENV_FILE_VALUES.items()):
+        if os.environ.get(key) == old_value and file_values.get(key) != old_value:
+            os.environ.pop(key, None)
+        if os.environ.get(key) != old_value:
+            _APPLIED_ENV_FILE_VALUES.pop(key, None)
+
+    for key, value in file_values.items():
+        if key not in os.environ:
+            os.environ[key] = value
+            _APPLIED_ENV_FILE_VALUES[key] = value
 
 
 def _env_file_candidates_from_env() -> list[Path]:
@@ -87,6 +120,18 @@ def _resolve_snapshot_source_priority() -> list[str]:
     return list(DEFAULT_SNAPSHOT_SOURCE_PRIORITY)
 
 
+def _resolve_fallback_snapshot_path(data_dir: Path) -> Path | None:
+    for name in ("ALPHASIFT_FALLBACK_SNAPSHOT_PATH", "FALLBACK_SNAPSHOT_PATH"):
+        raw = os.getenv(name)
+        if raw is None:
+            continue
+        value = raw.strip()
+        if value.lower() in {"", "0", "false", "none", "off"}:
+            return None
+        return Path(value)
+    return data_dir / "snapshot.last_good.json"
+
+
 def _default_strategies_dir() -> Path:
     """Find strategies directory: env var > project root > package bundled."""
     env_dir = os.getenv("STRATEGIES_DIR")
@@ -134,6 +179,9 @@ class Config:
     snapshot_source_priority: list[str] = field(
         default_factory=lambda: list(DEFAULT_SNAPSHOT_SOURCE_PRIORITY)
     )
+    fallback_snapshot_path: Path | None = (
+        _PROJECT_ROOT / "data" / "snapshot.last_good.json"
+    )
 
     # Strategy directory
     strategies_dir: Path = field(default_factory=_default_strategies_dir)
@@ -142,6 +190,10 @@ class Config:
     industry_map_files: list[Path] = field(default_factory=list)
     industry_provider: str = "none"
     industry_provider_max_boards: int = 80
+    industry_provider_cache_dir: Path | None = (
+        _PROJECT_ROOT / "data" / "industry_provider_cache"
+    )
+    industry_provider_cache_ttl_hours: int = 24
 
     # Optional: DSA API for L3 deep analysis
     dsa_api_url: str = ""
@@ -164,6 +216,8 @@ class Config:
     daily_lookback_days: int = 120
     daily_source: str = "akshare"
     daily_fetch_retries: int = 2
+    daily_history_cache_dir: Path | None = None
+    daily_history_cache_ttl_hours: int = 24
 
     # Independent risk layer.
     risk_enabled: bool = True
@@ -200,6 +254,18 @@ class Config:
         _load_env_file()
         channels = _parse_llm_channels_env()
         llm_model = _resolve_llm_model(channels)
+        data_dir = Path(os.getenv("ALPHASIFT_DATA_DIR", str(_PROJECT_ROOT / "data")))
+        fallback_snapshot_path = _resolve_fallback_snapshot_path(data_dir)
+        daily_history_cache_dir = (
+            _parse_optional_path_env("ALPHASIFT_DAILY_HISTORY_CACHE_DIR")
+            or _parse_optional_path_env("DAILY_HISTORY_CACHE_DIR")
+            or data_dir / "daily_history"
+        )
+        industry_provider_cache_dir = (
+            _parse_optional_path_env("ALPHASIFT_INDUSTRY_PROVIDER_CACHE_DIR")
+            or _parse_optional_path_env("INDUSTRY_PROVIDER_CACHE_DIR")
+            or data_dir / "industry_provider_cache"
+        )
         return cls(
             llm_api_key=_resolve_llm_api_key(llm_model),
             llm_model=llm_model,
@@ -238,6 +304,7 @@ class Config:
             llm_context_max_chars=max(500, int(os.getenv("LLM_CONTEXT_MAX_CHARS", "4000"))),
             llm_timeout_sec=max(1.0, _parse_float_env("LLM_TIMEOUT_SEC", 60.0)),
             snapshot_source_priority=_resolve_snapshot_source_priority(),
+            fallback_snapshot_path=fallback_snapshot_path,
             strategies_dir=_default_strategies_dir(),
             industry_map_files=[
                 Path(item)
@@ -245,6 +312,16 @@ class Config:
             ],
             industry_provider=os.getenv("INDUSTRY_PROVIDER", "none"),
             industry_provider_max_boards=max(1, int(os.getenv("INDUSTRY_PROVIDER_MAX_BOARDS", "80"))),
+            industry_provider_cache_dir=industry_provider_cache_dir,
+            industry_provider_cache_ttl_hours=max(
+                0,
+                int(
+                    os.getenv(
+                        "ALPHASIFT_INDUSTRY_PROVIDER_CACHE_TTL_HOURS",
+                        os.getenv("INDUSTRY_PROVIDER_CACHE_TTL_HOURS", "24"),
+                    )
+                ),
+            ),
             dsa_api_url=os.getenv("DSA_API_URL", ""),
             dsa_report_type=os.getenv("DSA_REPORT_TYPE", "detailed"),
             dsa_max_picks=max(1, int(os.getenv("DSA_MAX_PICKS", "3"))),
@@ -263,6 +340,16 @@ class Config:
             daily_lookback_days=max(30, int(os.getenv("DAILY_LOOKBACK_DAYS", "120"))),
             daily_source=os.getenv("DAILY_SOURCE", "akshare"),
             daily_fetch_retries=max(0, int(os.getenv("DAILY_FETCH_RETRIES", "2"))),
+            daily_history_cache_dir=daily_history_cache_dir,
+            daily_history_cache_ttl_hours=max(
+                0,
+                int(
+                    os.getenv(
+                        "ALPHASIFT_DAILY_HISTORY_CACHE_TTL_HOURS",
+                        os.getenv("DAILY_HISTORY_CACHE_TTL_HOURS", "24"),
+                    )
+                ),
+            ),
             risk_enabled=_parse_bool_env("RISK_ENABLED", True),
             risk_max_penalty=_parse_float_env("RISK_MAX_PENALTY", 12.0),
             risk_veto_high=_parse_bool_env("RISK_VETO_HIGH", False),
@@ -280,7 +367,7 @@ class Config:
                 30,
                 int(os.getenv("EVALUATION_PRICE_PATH_LOOKBACK_DAYS", "90")),
             ),
-            data_dir=Path(os.getenv("ALPHASIFT_DATA_DIR", str(_PROJECT_ROOT / "data"))),
+            data_dir=data_dir,
         )
 
 

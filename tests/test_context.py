@@ -164,3 +164,62 @@ def test_candidate_context_includes_source_confidence_fields():
     assert "事件标签:回购增持" in context
     assert "公告类别:业绩" in context
     assert "负面风险:监管" in context
+
+
+def test_build_llm_context_preserves_candidate_sections_under_budget():
+    candidate_df = pd.DataFrame([
+        {
+            "code": "000001",
+            "name": "平安银行",
+            "screen_score": 95,
+            "industry": "银行",
+            "concepts": "低估值",
+        },
+        {
+            "code": "600000",
+            "name": "浦发银行",
+            "screen_score": 90,
+            "industry": "银行",
+            "concepts": "中特估",
+        },
+        {
+            "code": "300001",
+            "name": "低优先级",
+            "screen_score": 50,
+            "industry": "其他",
+            "concepts": "长文本",
+        },
+    ])
+    degradation: list[str] = []
+
+    context = build_llm_context(
+        base_context="宏观背景" * 500,
+        candidate_df=candidate_df,
+        candidate_context_rows=[
+            {
+                "code": "000001",
+                "context_summary": "强催化 " * 80,
+                "news": "高优先级新闻 " * 80,
+            },
+            {
+                "code": "600000",
+                "context_summary": "次高优先级线索 " * 80,
+            },
+            {
+                "code": "300001",
+                "context_summary": "低优先级线索 " * 120,
+            },
+        ],
+        max_chars=900,
+        degradation=degradation,
+    )
+
+    assert len(context) <= 900
+    assert "候选身份" in context
+    assert "000001 平安银行" in context
+    assert "screen_score=95" in context
+    assert "候选抓取线索" in context
+    assert "强催化" in context
+    assert "context_trimmed" in context
+    assert degradation
+    assert degradation[0].startswith("LLM context truncated:")

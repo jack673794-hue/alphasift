@@ -225,3 +225,42 @@ def test_ranking_prompt_includes_dsa_provider_context():
     assert "fundamental_coverage=valuation" in prompt
     assert "news_titles=贵州茅台最新公告" in prompt
     assert "stock_news_slow" in prompt
+
+
+def test_ranking_prompt_is_bounded_and_keeps_required_fields():
+    picks = [
+        Pick(
+            rank=index + 1,
+            code=f"{index + 1:06d}",
+            name=f"候选{index + 1}",
+            final_score=100 - index,
+            screen_score=100 - index,
+            price=10 + index,
+            change_pct=1.5,
+            amount=100_000_000 + index,
+            industry="测试行业",
+            concepts="测试概念,长线索",
+            board_heat_score=80 - index,
+            dsa_analysis_summary="DSA摘要 " * 120,
+            dsa_news=[{"title": "重要新闻 " * 40}],
+        )
+        for index in range(12)
+    ]
+    degradation: list[str] = []
+
+    prompt = _build_ranking_prompt(
+        picks,
+        hints="优先主评分、行业热度和事件催化。" * 120,
+        context="市场上下文 " * 600,
+        max_chars=5000,
+        degradation=degradation,
+    )
+
+    assert len(prompt) <= 5000
+    assert "000001 候选1" in prompt
+    assert "rank=1" in prompt
+    assert "screen_score=100.0" in prompt
+    assert "000012 候选12" in prompt
+    assert "prompt_trimmed" in prompt
+    assert degradation
+    assert degradation[0].startswith("LLM ranking prompt truncated:")

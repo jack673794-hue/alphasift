@@ -104,3 +104,53 @@ def test_pipeline_preserves_degradation_when_hard_filter_empty(monkeypatch):
     assert result.picks == []
     assert any("Snapshot source fallback: efinance failed" in item for item in result.degradation)
     assert "No candidates after hard filter" in result.degradation
+
+
+def test_pipeline_passes_industry_provider_cache_config(monkeypatch, tmp_path):
+    df = pd.DataFrame([
+        {
+            "code": "000001",
+            "name": "骞冲畨閾惰",
+            "price": 10.0,
+            "change_pct": 0.0,
+            "amount": 100_000_000,
+            "turnover_rate": 2.0,
+            "volume_ratio": 1.2,
+            "pe_ratio": 8.0,
+            "pb_ratio": 0.8,
+            "total_mv": 100_000_000_000,
+        }
+    ])
+    df.attrs["snapshot_source"] = "test"
+    calls = []
+
+    def fake_enrich(frame, **kwargs):
+        calls.append(kwargs)
+        return frame, []
+
+    monkeypatch.setattr("alphasift.pipeline.fetch_snapshot_with_fallback", lambda sources, **kwargs: df)
+    monkeypatch.setattr("alphasift.pipeline.enrich_industry_concepts", fake_enrich)
+
+    cache_dir = tmp_path / "industry-cache"
+    screen(
+        "dual_low",
+        use_llm=False,
+        post_analyzers=[],
+        config=Config(
+            llm_api_key="",
+            snapshot_source_priority=["test"],
+            strategies_dir=Path("strategies"),
+            industry_provider="akshare",
+            industry_provider_cache_dir=cache_dir,
+            industry_provider_cache_ttl_hours=7,
+            risk_enabled=False,
+        ),
+    )
+
+    assert calls == [{
+        "map_files": [],
+        "provider": "akshare",
+        "max_boards": 80,
+        "provider_cache_dir": cache_dir,
+        "provider_cache_ttl_hours": 7,
+    }]

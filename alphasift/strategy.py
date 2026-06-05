@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Strategy YAML loader."""
 
+import hashlib
 import logging
 from pathlib import Path
 
@@ -152,6 +153,10 @@ _EVENT_PROFILE_KEYS = {
     "source_weights",
     "notes",
 }
+_STRATEGY_DIR_CACHE: dict[
+    Path,
+    tuple[tuple[tuple[str, int, int, str], ...], dict[str, Strategy]],
+] = {}
 
 
 def load_strategy(filepath: Path) -> Strategy:
@@ -214,9 +219,16 @@ def load_strategy(filepath: Path) -> Strategy:
 
 def load_all_strategies(strategies_dir: Path) -> dict[str, Strategy]:
     """Load all strategies from a directory."""
+    resolved_dir = strategies_dir.resolve()
+    signature = _strategy_dir_signature(resolved_dir)
+    cached = _STRATEGY_DIR_CACHE.get(resolved_dir)
+    if cached is not None and cached[0] == signature:
+        return dict(cached[1])
+
     _validate_strategy_dir_sync(strategies_dir)
     strategies = {}
     if not strategies_dir.is_dir():
+        _STRATEGY_DIR_CACHE[resolved_dir] = (signature, strategies)
         return strategies
     for f in sorted(strategies_dir.glob("*.yaml")):
         try:
@@ -226,7 +238,22 @@ def load_all_strategies(strategies_dir: Path) -> dict[str, Strategy]:
         except Exception as e:
             logger.warning("Failed to load strategy %s: %s", f.name, e)
             continue
-    return strategies
+    _STRATEGY_DIR_CACHE[resolved_dir] = (signature, dict(strategies))
+    return dict(strategies)
+
+
+def _strategy_dir_signature(strategies_dir: Path) -> tuple[tuple[str, int, int, str], ...]:
+    if not strategies_dir.is_dir():
+        return ()
+    signature = []
+    for filepath in sorted(strategies_dir.glob("*.yaml")):
+        try:
+            stat = filepath.stat()
+            digest = hashlib.sha256(filepath.read_bytes()).hexdigest()
+        except OSError:
+            continue
+        signature.append((filepath.name, stat.st_mtime_ns, stat.st_size, digest))
+    return tuple(signature)
 
 
 def list_strategies(strategies_dir: Path | None = None) -> list[StrategyInfo]:

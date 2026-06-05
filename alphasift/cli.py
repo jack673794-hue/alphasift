@@ -13,6 +13,13 @@ from pathlib import Path
 from alphasift.audit import audit_project
 from alphasift.config import Config
 from alphasift.evaluate import evaluate_saved_run, evaluate_saved_runs
+from alphasift.hotspot import (
+    append_hotspot_history,
+    discover_hotspots,
+    get_hotspot_detail,
+    hotspot_detail_to_dict,
+    save_hotspots_json,
+)
 from alphasift.industry import fetch_akshare_board_map, save_industry_map
 from alphasift.pipeline import screen
 from alphasift.store import (
@@ -178,6 +185,35 @@ def main():
     icp.add_argument("--output", default="data/industry_map.csv", help="输出 CSV/JSON 路径")
     icp.add_argument("--explain", action="store_true", help="输出紧凑摘要")
 
+    # hotspots
+    hp = sub.add_parser("hotspots", help="发现并排序热点概念/行业")
+    hp.add_argument("--top", type=int, default=20, help="输出前 N 个热点")
+    hp.add_argument("--provider", default="akshare", help="热点 provider：akshare 或 none")
+    hp.add_argument("--max-boards", type=int, default=80, help="每类最多读取 N 个板块")
+    hp.add_argument("--history-path", default=None, help="读取热点 history JSONL 并回填趋势")
+    hp.add_argument("--fallback-cache", default=None, help="live provider 失败/无数据时读取 last-good 热点缓存")
+    hp.add_argument("--output", default=None, help="额外写出热点 JSON")
+    hp.add_argument("--explain", action="store_true", help="输出紧凑摘要")
+
+    hdp = sub.add_parser("hotspot", help="查看单个热点详情")
+    hdp.add_argument("topic", help="热点/概念/行业名称")
+    hdp.add_argument("--provider", default="akshare", help="热点 provider：akshare 或 none")
+    hdp.add_argument("--top-stocks", type=int, default=10, help="输出前 N 只热点成分股")
+    hdp.add_argument("--history-path", default=None, help="读取热点 history JSONL 并回填趋势")
+    hdp.add_argument("--fallback-cache", default=None, help="live provider 失败/无数据时读取 last-good 热点缓存")
+    hdp.add_argument("--timeline", action="store_true", help="加载并展示热点时间线")
+    hdp.add_argument("--timeline-path", default=None, help="热点时间线 JSONL")
+    hdp.add_argument("--output", default=None, help="额外写出详情 JSON")
+    hdp.add_argument("--explain", action="store_true", help="输出紧凑摘要")
+
+    hcp = sub.add_parser("hotspot-cache", help="刷新热点排行缓存并追加 history")
+    hcp.add_argument("--top", type=int, default=20, help="缓存前 N 个热点")
+    hcp.add_argument("--provider", default="akshare", help="热点 provider：akshare 或 none")
+    hcp.add_argument("--max-boards", type=int, default=80, help="每类最多读取 N 个板块")
+    hcp.add_argument("--history-path", default="data/hotspot.history.jsonl", help="追加写入 history JSONL")
+    hcp.add_argument("--output", default="data/hotspots.json", help="输出热点 JSON")
+    hcp.add_argument("--explain", action="store_true", help="输出紧凑摘要")
+
     # audit
     ap = sub.add_parser("audit", help="评估项目能力、策略配置覆盖和已知短板")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出")
@@ -327,6 +363,90 @@ def main():
                 "history_path": str(history_path),
                 "rows": len(mapping),
                 "notes": notes,
+            }, ensure_ascii=False, indent=2))
+
+    elif args.command == "hotspots":
+        hotspots = discover_hotspots(
+            provider=args.provider,
+            max_boards=args.max_boards,
+            history_path=args.history_path,
+            fallback_cache_path=args.fallback_cache,
+            top=args.top,
+        )
+        if args.output:
+            save_hotspots_json(args.output, hotspots)
+        if args.explain:
+            print(_format_hotspots_explain(hotspots, provider=args.provider))
+        else:
+            print(json.dumps([asdict(item) for item in hotspots], ensure_ascii=False, indent=2))
+
+    elif args.command == "hotspot":
+        timeline_path = args.timeline_path if args.timeline else None
+        detail = get_hotspot_detail(
+            args.topic,
+            provider=args.provider,
+            top_stocks=args.top_stocks,
+            timeline_path=timeline_path,
+            history_path=args.history_path,
+            fallback_cache_path=args.fallback_cache,
+        )
+        if args.output:
+            output_path = Path(args.output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                json.dumps(hotspot_detail_to_dict(detail), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        if args.explain:
+            print(_format_hotspot_detail_explain(detail))
+        else:
+            print(json.dumps(hotspot_detail_to_dict(detail), ensure_ascii=False, indent=2))
+
+    elif args.command == "hotspot-cache":
+        hotspots = discover_hotspots(
+            provider=args.provider,
+            max_boards=args.max_boards,
+            history_path=args.history_path,
+            fallback_cache_path=args.output,
+            top=args.top,
+        )
+        fallback_used = bool(getattr(hotspots, "fallback_used", False))
+        generated_at = datetime.now().isoformat()
+        history_path = None
+        history_appended = False
+        output_path = Path(args.output)
+        if fallback_used:
+            if not output_path.exists():
+                output_path = save_hotspots_json(args.output, hotspots)
+        else:
+            output_path = save_hotspots_json(args.output, hotspots)
+            history_path = append_hotspot_history(args.history_path, hotspots, generated_at=generated_at)
+            history_appended = True
+        metadata_path = _write_hotspot_cache_metadata(
+            output_path,
+            provider=args.provider,
+            max_boards=args.max_boards,
+            rows=len(hotspots),
+            generated_at=generated_at,
+            history_path=history_path,
+            fallback_used=fallback_used,
+            source_errors=getattr(hotspots, "source_errors", []),
+            history_appended=history_appended,
+        )
+        if args.explain:
+            print(
+                f"hotspot_cache={output_path} metadata={metadata_path} "
+                f"history={history_path or '-'} rows={len(hotspots)} "
+                f"fallback={fallback_used}"
+            )
+        else:
+            print(json.dumps({
+                "path": str(output_path),
+                "metadata_path": str(metadata_path),
+                "history_path": str(history_path) if history_path is not None else "",
+                "rows": len(hotspots),
+                "fallback_used": fallback_used,
+                "source_errors": getattr(hotspots, "source_errors", []),
             }, ensure_ascii=False, indent=2))
 
     elif args.command == "audit":
@@ -512,6 +632,78 @@ def _format_evaluation_batch_explain(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_hotspots_explain(hotspots: list, *, provider: str = "") -> str:
+    provider_text = getattr(hotspots, "provider_used", "") or provider or "-"
+    metadata_bits = [f"hotspots={len(hotspots)}", f"provider={provider_text}"]
+    if getattr(hotspots, "fallback_used", False):
+        metadata_bits.append("fallback=True")
+    if getattr(hotspots, "stale", False):
+        metadata_bits.append("stale=True")
+    source_errors = getattr(hotspots, "source_errors", []) or []
+    if source_errors:
+        metadata_bits.append("source_errors=" + " | ".join(source_errors))
+    if not hotspots:
+        return " ".join(metadata_bits)
+    lines = [
+        " ".join(metadata_bits),
+        "rank topic source src_rank change heat trend persistence cooling state stage sample leaders",
+    ]
+    for idx, item in enumerate(hotspots, start=1):
+        leaders = ",".join(item.leaders[:3]) if getattr(item, "leaders", None) else "-"
+        lines.append(
+            f"{idx:<4} {item.topic:<14} {item.source or '-':<8} "
+            f"{item.rank if item.rank is not None else '-':<8} "
+            f"{_fmt_pct(item.change_pct):<8} "
+            f"{item.heat_score:<6.1f} "
+            f"{_fmt_optional_float(item.trend_score):<8} "
+            f"{_fmt_optional_float(item.persistence_score):<11} "
+            f"{_fmt_optional_float(item.cooling_score):<7} "
+            f"{item.state or '-':<14} {item.stage:<8} "
+            f"{item.sample_stock_count:<6} {leaders}"
+        )
+    return "\n".join(lines)
+
+
+def _format_hotspot_detail_explain(detail) -> str:
+    summary = detail.summary
+    leaders = ",".join(summary.leaders[:3]) if summary.leaders else "-"
+    lines = [
+        (
+            f"topic={summary.topic} source={summary.source or '-'} "
+            f"src_rank={summary.rank if summary.rank is not None else '-'} "
+            f"change={_fmt_pct(summary.change_pct)} heat={summary.heat_score:.1f} "
+            f"trend={_fmt_optional_float(summary.trend_score)} "
+            f"persistence={_fmt_optional_float(summary.persistence_score)} "
+            f"cooling={_fmt_optional_float(summary.cooling_score)} "
+            f"state={summary.state or '-'} stage={summary.stage} "
+            f"sample={summary.sample_stock_count} leaders={leaders} "
+            f"provider={summary.provider_used or '-'} fallback={summary.fallback_used}"
+        ),
+        "rank code name role score change amount turnover volume_ratio net_inflow active evidence",
+    ]
+    if summary.source_errors:
+        lines.append("source_errors=" + " | ".join(summary.source_errors))
+    for idx, stock in enumerate(detail.stocks, start=1):
+        lines.append(
+            f"{idx:<4} {stock.code:<8} {stock.name:<10} {stock.role or '-':<8} "
+            f"{stock.hot_stock_score:<6.1f} {_fmt_pct(stock.change_pct):<8} "
+            f"{_fmt_optional_float(stock.amount):<10} "
+            f"{_fmt_optional_float(stock.turnover_rate):<8} "
+            f"{_fmt_optional_float(stock.volume_ratio):<12} "
+            f"{_fmt_optional_float(stock.net_inflow):<10} "
+            f"{stock.active_days:<6} {stock.evidence_count}"
+        )
+    if detail.timeline:
+        lines.append("timeline date source type impact title codes")
+        for event in detail.timeline:
+            codes = ",".join(event.related_codes) if event.related_codes else "-"
+            lines.append(
+                f"{event.date:<12} {event.source:<8} {event.event_type:<10} "
+                f"{event.impact_score:<6.1f} {event.title[:40]} {codes}"
+            )
+    return "\n".join(lines)
+
+
 def _top_dimension_items(items: dict, *, limit: int = 5) -> list[str]:
     ranked = sorted(
         items.items(),
@@ -532,6 +724,10 @@ def _top_dimension_items(items: dict, *, limit: int = 5) -> list[str]:
 
 def _fmt_pct(value: float | None) -> str:
     return "-" if value is None else f"{float(value):.2f}%"
+
+
+def _fmt_optional_float(value: float | None) -> str:
+    return "-" if value is None else f"{float(value):.2f}"
 
 
 def _format_audit_explain(result: dict) -> str:
@@ -590,6 +786,33 @@ def _write_industry_cache_metadata(
         "rows": rows,
         "history_path": str(history_path) if history_path is not None else "",
         "notes": notes,
+    }
+    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    return metadata_path
+
+
+def _write_hotspot_cache_metadata(
+    output_path: Path,
+    *,
+    provider: str,
+    max_boards: int,
+    rows: int,
+    generated_at: str | None = None,
+    history_path: Path | None = None,
+    fallback_used: bool = False,
+    source_errors: list[str] | None = None,
+    history_appended: bool = True,
+) -> Path:
+    metadata_path = output_path.with_suffix(output_path.suffix + ".meta.json")
+    metadata = {
+        "generated_at": generated_at or datetime.now().isoformat(),
+        "provider": provider,
+        "max_boards": max_boards,
+        "rows": rows,
+        "history_path": str(history_path) if history_path is not None else "",
+        "fallback_used": fallback_used,
+        "source_errors": source_errors or [],
+        "history_appended": history_appended,
     }
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     return metadata_path

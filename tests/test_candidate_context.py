@@ -1,5 +1,9 @@
+import threading
+import time
+
 import pandas as pd
 
+import alphasift.candidate_context as candidate_context
 from alphasift.candidate_context import (
     classify_announcement_categories,
     classify_negative_events,
@@ -41,34 +45,67 @@ def test_collect_candidate_context_uses_requested_providers(monkeypatch):
     assert isinstance(rows[0]["negative_event_flags"], list)
 
 
-def test_collect_candidate_context_records_row_errors(monkeypatch):
-    class FakeAkshare:
-        @staticmethod
-        def stock_news_em(symbol):
-            raise ConnectionError("disconnect")
+def test_collect_candidate_context_concurrent_fetch_preserves_candidate_order(monkeypatch):
+    barrier = threading.Barrier(2)
 
-    monkeypatch.setitem(__import__("sys").modules, "akshare", FakeAkshare)
-    candidates = pd.DataFrame([{"code": "000001", "name": "平安银行"}])
+    def fake_news_summary(code, *, limit=3):
+        barrier.wait(timeout=1)
+        if code == "000001":
+            time.sleep(0.05)
+        return f"{code} 获资金关注"
+
+    monkeypatch.setattr(candidate_context, "fetch_stock_news_summary", fake_news_summary)
+    candidates = pd.DataFrame(
+        [
+            {"code": "000001", "name": "平安银行"},
+            {"code": "000002", "name": "万科A"},
+        ]
+    )
 
     rows, errors = collect_candidate_context(candidates, providers=["news"])
 
-    assert rows == []
-    assert "000001 news" in errors[0]
+    assert errors == []
+    assert [row["code"] for row in rows] == ["000001", "000002"]
+    assert rows[0]["news"] == "000001 获资金关注"
+    assert rows[1]["news"] == "000002 获资金关注"
+
+
+def test_collect_candidate_context_records_row_errors_without_aborting_other_candidates(monkeypatch):
+    def fake_news_summary(code, *, limit=3):
+        if code == "000001":
+            raise ConnectionError("disconnect")
+        return f"{code} 获资金关注"
+
+    monkeypatch.setattr(candidate_context, "fetch_stock_news_summary", fake_news_summary)
+    candidates = pd.DataFrame(
+        [
+            {"code": "000001", "name": "平安银行"},
+            {"code": "000002", "name": "万科A"},
+        ]
+    )
+
+    rows, errors = collect_candidate_context(candidates, providers=["news"])
+
+    assert [row["code"] for row in rows] == ["000002"]
+    assert errors == ["000001 news: disconnect"]
 
 
 def test_collect_candidate_context_uses_cache(monkeypatch, tmp_path):
-    class FakeAkshare:
-        calls = 0
+    calls = []
+    calls_lock = threading.Lock()
 
-        @staticmethod
-        def stock_news_em(symbol):
-            FakeAkshare.calls += 1
-            return pd.DataFrame([
-                {"发布时间": "2026-04-28", "新闻标题": f"{symbol} 首次抓取"},
-            ])
+    def fake_news_summary(code, *, limit=3):
+        with calls_lock:
+            calls.append(code)
+        return f"{code} 首次抓取"
 
-    monkeypatch.setitem(__import__("sys").modules, "akshare", FakeAkshare)
-    candidates = pd.DataFrame([{"code": "000001", "name": "平安银行"}])
+    monkeypatch.setattr(candidate_context, "fetch_stock_news_summary", fake_news_summary)
+    candidates = pd.DataFrame(
+        [
+            {"code": "000001", "name": "平安银行"},
+            {"code": "000002", "name": "万科A"},
+        ]
+    )
 
     first, _ = collect_candidate_context(
         candidates,
@@ -81,7 +118,7 @@ def test_collect_candidate_context_uses_cache(monkeypatch, tmp_path):
         cache_dir=tmp_path,
     )
 
-    assert FakeAkshare.calls == 1
+    assert sorted(calls) == ["000001", "000002"]
     assert second == first
 
 

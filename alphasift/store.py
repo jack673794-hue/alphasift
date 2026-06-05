@@ -9,6 +9,8 @@ from pathlib import Path
 
 from alphasift.models import EvaluationResult, Pick, PickEvaluation, ScreenResult
 
+_RUN_METADATA_SUFFIX = ".meta"
+
 
 def save_screen_result(
     result: ScreenResult,
@@ -28,6 +30,7 @@ def save_screen_result(
             json.dumps(asdict(result), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+    _write_screen_result_metadata(result, output_path)
     return output_path
 
 
@@ -69,27 +72,86 @@ def save_evaluation_result(
     return output_path
 
 
-def list_saved_runs(*, data_dir: Path, limit: int = 20) -> list[dict[str, object]]:
+def list_saved_runs(
+    *,
+    data_dir: Path,
+    limit: int = 20,
+    strategy: str | None = None,
+) -> list[dict[str, object]]:
     runs_dir = data_dir / "runs"
     if not runs_dir.is_dir():
         return []
+    limit = int(limit)
+    if limit <= 0:
+        return []
     items = []
     for path in sorted(runs_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
+        metadata = _read_run_metadata(path)
+        if metadata is None:
             continue
-        items.append({
-            "run_id": data.get("run_id", path.stem),
-            "strategy": data.get("strategy", ""),
-            "market": data.get("market", ""),
-            "created_at": data.get("created_at", ""),
-            "picks": len(data.get("picks", []) or []),
-            "path": str(path),
-        })
+        if strategy and metadata.get("strategy") != strategy:
+            continue
+        items.append(metadata)
         if len(items) >= limit:
             break
     return items
+
+
+def _write_screen_result_metadata(result: ScreenResult, output_path: Path) -> None:
+    metadata_path = _run_metadata_path(output_path)
+    metadata = {
+        "run_id": result.run_id or output_path.stem,
+        "strategy": result.strategy,
+        "market": result.market,
+        "created_at": result.created_at,
+        "picks": len(result.picks),
+        "path": str(output_path),
+    }
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _run_metadata_path(run_path: Path) -> Path:
+    return run_path.with_suffix(run_path.suffix + _RUN_METADATA_SUFFIX)
+
+
+def _read_run_metadata(path: Path) -> dict[str, object] | None:
+    metadata_path = _run_metadata_path(path)
+    if metadata_path.is_file():
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if isinstance(metadata, dict):
+                return _normalize_run_metadata(metadata, path)
+        except Exception:
+            pass
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _normalize_run_metadata(data, path)
+
+
+def _normalize_run_metadata(data: dict, path: Path) -> dict[str, object]:
+    picks = data.get("picks", [])
+    if isinstance(picks, list):
+        pick_count = len(picks)
+    else:
+        try:
+            pick_count = int(picks)
+        except (TypeError, ValueError):
+            pick_count = 0
+    return {
+        "run_id": data.get("run_id", path.stem),
+        "strategy": data.get("strategy", ""),
+        "market": data.get("market", ""),
+        "created_at": data.get("created_at", ""),
+        "picks": pick_count,
+        "path": str(path),
+    }
 
 
 def resolve_run_path(run_ref: str | Path, *, data_dir: Path) -> Path:

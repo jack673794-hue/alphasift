@@ -2,6 +2,7 @@ from alphasift.dsa import (
     apply_dsa_overlay,
     analyze_picks_with_dsa,
     build_dsa_analyze_url,
+    check_dsa_readiness,
     extract_deep_analysis_summary,
 )
 from alphasift.models import Pick
@@ -14,6 +15,57 @@ def test_build_dsa_analyze_url_accepts_base_or_full_endpoint():
     assert build_dsa_analyze_url("http://localhost:8000/api/v1/analysis/analyze") == (
         "http://localhost:8000/api/v1/analysis/analyze"
     )
+
+
+def test_check_dsa_readiness_reports_missing_url_without_network(monkeypatch):
+    def fail_get(*_args, **_kwargs):
+        raise AssertionError("network should not be called")
+
+    monkeypatch.setattr("alphasift.dsa.requests.get", fail_get)
+
+    status = check_dsa_readiness("")
+
+    assert status["available"] is False
+    assert status["status"] == "missing_url"
+    assert status["endpoint"] == ""
+
+
+def test_check_dsa_readiness_classifies_http_status_without_live_network(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, status_code):
+            self.status_code = status_code
+            self.text = ""
+
+    def fake_get(url, timeout):
+        calls.append((url, timeout))
+        return FakeResponse(405)
+
+    monkeypatch.setattr("alphasift.dsa.requests.get", fake_get)
+
+    status = check_dsa_readiness("http://localhost:8000", timeout_sec=1.5)
+
+    assert calls == [("http://localhost:8000/api/v1/analysis/analyze", 1.5)]
+    assert status["available"] is True
+    assert status["status"] == "route_present"
+
+
+def test_check_dsa_readiness_reports_auth_and_missing_route(monkeypatch):
+    class FakeResponse:
+        def __init__(self, status_code):
+            self.status_code = status_code
+            self.text = "nope"
+
+    monkeypatch.setattr("alphasift.dsa.requests.get", lambda *_args, **_kwargs: FakeResponse(401))
+    unauthorized = check_dsa_readiness("http://localhost:8000")
+    assert unauthorized["available"] is False
+    assert unauthorized["status"] == "unauthorized"
+
+    monkeypatch.setattr("alphasift.dsa.requests.get", lambda *_args, **_kwargs: FakeResponse(404))
+    missing = check_dsa_readiness("http://localhost:8000")
+    assert missing["available"] is False
+    assert missing["status"] == "route_missing"
 
 
 def test_extract_deep_analysis_summary_prefers_analysis_summary_over_operation_advice():

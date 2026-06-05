@@ -4,12 +4,19 @@
 import json
 import logging
 import os
-import re
 from dataclasses import dataclass
 
 from alphasift.models import Pick
+from alphasift.normalize import (
+    bounded_float as _bounded_float,
+    normalize_code as _normalize_code,
+    safe_string_list as _safe_string_list,
+    safe_text,
+)
 
 logger = logging.getLogger(__name__)
+_DEFAULT_RANKING_PROMPT_MAX_CHARS = 24_000
+_PROMPT_TRIM_MARKER = "[prompt_trimmed]"
 
 
 @dataclass
@@ -55,6 +62,7 @@ def rank_candidates(
     channels: list[dict[str, object]] | None = None,
     config_path: str = "",
     timeout_sec: float = 60.0,
+    max_prompt_chars: int | None = _DEFAULT_RANKING_PROMPT_MAX_CHARS,
 ) -> list[Pick]:
     """Use LLM to re-rank candidates and add ranking_reason / risk_summary.
 
@@ -77,6 +85,7 @@ def rank_candidates(
         channels=channels,
         config_path=config_path,
         timeout_sec=timeout_sec,
+        max_prompt_chars=max_prompt_chars,
     ).picks
 
 
@@ -98,12 +107,20 @@ def rank_candidates_with_metadata(
     channels: list[dict[str, object]] | None = None,
     config_path: str = "",
     timeout_sec: float = 60.0,
+    max_prompt_chars: int | None = _DEFAULT_RANKING_PROMPT_MAX_CHARS,
+    degradation: list[str] | None = None,
 ) -> LLMRankingResult:
     """Use LLM to re-rank candidates and return global research metadata."""
     if not candidates:
         return LLMRankingResult(picks=candidates)
 
-    prompt = _build_ranking_prompt(candidates, ranking_hints, context)
+    prompt = _build_ranking_prompt(
+        candidates,
+        ranking_hints,
+        context,
+        max_chars=max_prompt_chars,
+        degradation=degradation,
+    )
 
     try:
         last_errors: list[str] = []
@@ -162,8 +179,30 @@ def rank_candidates_with_metadata(
         return LLMRankingResult(picks=candidates, errors=[str(e)])
 
 
-def _build_ranking_prompt(candidates: list[Pick], hints: str, context: str = "") -> str:
+def _build_ranking_prompt(
+    candidates: list[Pick],
+    hints: str,
+    context: str = "",
+    *,
+    max_chars: int | None = _DEFAULT_RANKING_PROMPT_MAX_CHARS,
+    degradation: list[str] | None = None,
+) -> str:
+    hints_text = hints.strip() or "无额外排序提示。"
+    context_text = context.strip() or "无额外上下文。只能基于候选池结构化数据和策略偏好判断。"
     candidates_text = "\n".join(_format_candidate_for_prompt(p) for p in candidates)
+    prompt = _render_ranking_prompt(hints_text, context_text, candidates_text)
+    if max_chars is None or len(prompt) <= max_chars:
+        return prompt
+    return _build_bounded_ranking_prompt(
+        candidates,
+        hints_text,
+        context_text,
+        max_chars=max_chars,
+        degradation=degradation,
+    )
+
+
+def _render_ranking_prompt(hints: str, context: str, candidates_text: str) -> str:
     return f"""你是一个专业的股票研究员，任务是在“已经由代码硬筛过”的候选池内做相对排序。
 你不能推荐候选池外股票，不能修改硬筛条件，不能给目标价或承诺收益。你的价值在于：
 1. 结合策略偏好，对候选之间做跨股票比较；
@@ -175,7 +214,7 @@ def _build_ranking_prompt(candidates: list[Pick], hints: str, context: str = "")
 {hints}
 
 ## 市场/情报上下文
-{context or "无额外上下文。只能基于候选池结构化数据和策略偏好判断。"}
+{context}
 
 ## 候选列表
 {candidates_text}
@@ -209,7 +248,83 @@ def _build_ranking_prompt(candidates: list[Pick], hints: str, context: str = "")
 """
 
 
-def _format_candidate_for_prompt(p: Pick) -> str:
+def _build_bounded_ranking_prompt(
+    candidates: list[Pick],
+    hints: str,
+    context: str,
+    *,
+    max_chars: int,
+    degradation: list[str] | None,
+) -> str:
+    trimmed: list[str] = []
+    identity_text = "\n".join(_format_candidate_for_prompt(p, detail="identity") for p in candidates)
+    base_min = _render_ranking_prompt(
+        _truncate_prompt_text(hints, 900, "hints", trimmed),
+        "",
+        identity_text,
+    )
+    context_budget = max(int(max_chars) - len(base_min) - 80, 0)
+    context_text = _truncate_prompt_text(context, context_budget, "context", trimmed)
+
+    prompt_without_candidates = _render_ranking_prompt(
+        _truncate_prompt_text(hints, 900, "hints", trimmed),
+        context_text,
+        "",
+    )
+    candidate_budget = max(int(max_chars) - len(prompt_without_candidates), 0)
+    candidates_text = _fit_candidate_prompt_lines(candidates, candidate_budget, trimmed)
+    prompt = _render_ranking_prompt(
+        _truncate_prompt_text(hints, 900, "hints", trimmed),
+        context_text,
+        candidates_text,
+    )
+
+    if len(prompt) > max_chars:
+        overflow = len(prompt) - int(max_chars)
+        context_text = _truncate_prompt_text(
+            context_text,
+            max(len(context_text) - overflow - 80, 0),
+            "context",
+            trimmed,
+        )
+        prompt_without_candidates = _render_ranking_prompt(
+            _truncate_prompt_text(hints, 600, "hints", trimmed),
+            context_text,
+            "",
+        )
+        candidate_budget = max(int(max_chars) - len(prompt_without_candidates), 0)
+        candidates_text = _fit_candidate_prompt_lines(candidates, candidate_budget, trimmed)
+        prompt = _render_ranking_prompt(
+            _truncate_prompt_text(hints, 600, "hints", trimmed),
+            context_text,
+            candidates_text,
+        )
+
+    if len(prompt) > max_chars:
+        marker = f"\n...{_PROMPT_TRIM_MARKER}:hard_cap"
+        prompt = prompt[: max(int(max_chars) - len(marker), 0)].rstrip() + marker
+        trimmed.append("hard_cap")
+
+    if trimmed and degradation is not None:
+        labels = ",".join(dict.fromkeys(trimmed))
+        degradation.append(f"LLM ranking prompt truncated: trimmed={labels}")
+    return prompt[:max_chars]
+
+
+def _format_candidate_for_prompt(p: Pick, *, detail: str = "full") -> str:
+    if detail == "identity":
+        return (
+            f"- {p.code} {p.name}: rank={p.rank}, "
+            f"screen_score={p.screen_score:.1f}, final_score={p.final_score:.1f}"
+        )
+    if detail == "compact":
+        return (
+            f"- {p.code} {p.name}: rank={p.rank}, price={p.price}, "
+            f"change_pct={p.change_pct}%, amount={p.amount:.0f}, "
+            f"screen_score={p.screen_score:.1f}, industry={p.industry or 'unknown'}, "
+            f"concepts={p.concepts or 'unknown'}, board_heat_score={p.board_heat_score}, "
+            f"signal_score={p.signal_score}, dsa_context={_format_dsa_context_for_prompt(p)}"
+        )
     return (
         f"- {p.code} {p.name}: price={p.price}, change_pct={p.change_pct}%, "
         f"amount={p.amount:.0f}, turnover={p.turnover_rate}, volume_ratio={p.volume_ratio}, "
@@ -232,6 +347,63 @@ def _format_candidate_for_prompt(p: Pick) -> str:
         f"screen_score={p.screen_score:.1f}, factor_scores={p.factor_scores}, "
         f"dsa_context={_format_dsa_context_for_prompt(p)}"
     )
+
+
+def _fit_candidate_prompt_lines(
+    candidates: list[Pick],
+    budget: int,
+    trimmed: list[str],
+) -> str:
+    marker = f"...{_PROMPT_TRIM_MARKER}:candidate_details"
+    full_text = "\n".join(_format_candidate_for_prompt(p) for p in candidates)
+    if len(full_text) <= budget:
+        return full_text
+
+    available = max(int(budget) - len(marker) - 1, 0)
+    if available <= 0:
+        trimmed.append("candidate_details")
+        return marker[:budget]
+
+    identity_lines = [_format_candidate_for_prompt(p, detail="identity") for p in candidates]
+    lines: list[str] = []
+    used = 0
+    omitted = 0
+    for line in identity_lines:
+        extra = len(line) + (1 if lines else 0)
+        if used + extra > available:
+            omitted += 1
+            continue
+        lines.append(line)
+        used += extra
+
+    if omitted == 0:
+        for idx, pick in enumerate(candidates):
+            for detail in ("full", "compact"):
+                replacement = _format_candidate_for_prompt(pick, detail=detail)
+                delta = len(replacement) - len(lines[idx])
+                if used + delta <= available:
+                    lines[idx] = replacement
+                    used += delta
+                    break
+
+    if omitted:
+        trimmed.append("candidate_omitted")
+        lines.append(f"...{_PROMPT_TRIM_MARKER}:candidate_omitted={omitted}")
+    else:
+        trimmed.append("candidate_details")
+        lines.append(marker)
+    return "\n".join(lines)
+
+
+def _truncate_prompt_text(text: str, limit: int, label: str, trimmed: list[str]) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    marker = f"\n...{_PROMPT_TRIM_MARKER}:{label}"
+    trimmed.append(label)
+    if limit <= len(marker) + 8:
+        return marker[:limit]
+    return text[: max(limit - len(marker), 0)].rstrip() + marker
 
 
 def _format_dsa_context_for_prompt(p: Pick) -> str:
@@ -459,41 +631,8 @@ def _parse_ranking_response_detail(response: str, candidates: list[Pick]) -> Ran
     )
 
 
-def _safe_float(value) -> float | None:
-    try:
-        if value is None or value == "":
-            return None
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _normalize_code(value: object) -> str:
-    text = "" if value is None else str(value).strip()
-    if not text or text.lower() in {"nan", "none", "<na>"}:
-        return ""
-    if text.endswith(".0") and text[:-2].isdigit():
-        text = text[:-2]
-    if text.isdigit():
-        return text.zfill(6)[-6:]
-    match = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
-    if match:
-        return match.group(1)
-    digits = "".join(ch for ch in text if ch.isdigit())
-    return digits.zfill(6)[-6:] if digits else ""
-
-
-def _bounded_float(value, *, low: float, high: float) -> float | None:
-    parsed = _safe_float(value)
-    if parsed is None:
-        return None
-    return max(low, min(parsed, high))
-
-
 def _safe_str(value, *, max_len: int) -> str:
-    if value is None:
-        return ""
-    return str(value).strip()[:max_len]
+    return safe_text(value, max_len=max_len)
 
 
 def _try_parse_json_lenient(raw: str, errors: list[str]):
@@ -535,12 +674,6 @@ def _try_parse_json_lenient(raw: str, errors: list[str]):
     errors.append(f"json_decode_error:{first_error}")
     logger.warning("Failed to parse LLM ranking JSON: %s", first_error)
     return None
-
-
-def _safe_string_list(value) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [str(item).strip()[:80] for item in value if str(item).strip()]
 
 
 def _call_litellm_router(

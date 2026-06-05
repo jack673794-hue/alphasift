@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
-import re
 from pathlib import Path
 
 import pandas as pd
 
+from alphasift.normalize import normalize_code as _normalize_code
+
+_CONTEXT_TRIM_MARKER = "[context_trimmed]"
 _CANDIDATE_CONTEXT_COLUMNS = {
     "news": "新闻",
     "announcement": "公告",
@@ -30,6 +33,16 @@ _CANDIDATE_CONTEXT_COLUMNS = {
 }
 
 
+@dataclass(frozen=True)
+class _ContextSection:
+    text: str
+    kind: str
+    priority: int
+    min_chars: int
+    weight: int
+    line_aware: bool = False
+
+
 def build_llm_context(
     *,
     base_context: str = "",
@@ -40,52 +53,115 @@ def build_llm_context(
     candidate_df: pd.DataFrame | None = None,
     event_profile: dict[str, object] | None = None,
     max_chars: int = 4000,
+    degradation: list[str] | None = None,
 ) -> str:
     """Build bounded context text for the LLM soft ranker."""
-    sections: list[str] = []
+    sections: list[_ContextSection] = []
     if base_context.strip():
-        sections.append("【人工上下文】\n" + base_context.strip())
+        sections.append(_section(
+            "【人工上下文】\n" + base_context.strip(),
+            kind="market_context",
+            priority=5,
+            min_chars=80,
+            weight=1,
+            line_aware=True,
+        ))
 
     file_context = _read_context_files(context_files or [])
     if file_context:
-        sections.append("【上下文文件】\n" + file_context)
+        sections.append(_section(
+            "【上下文文件】\n" + file_context,
+            kind="market_files",
+            priority=5,
+            min_chars=80,
+            weight=1,
+            line_aware=True,
+        ))
 
     event_profile_context = summarize_event_profile(event_profile)
     if event_profile_context:
-        sections.append(event_profile_context)
+        sections.append(_section(
+            event_profile_context,
+            kind="event_profile",
+            priority=2,
+            min_chars=160,
+            weight=2,
+            line_aware=True,
+        ))
+
+    candidate_identity = summarize_candidate_identity(candidate_df)
+    if candidate_identity:
+        sections.append(_section(
+            candidate_identity,
+            kind="candidate_identity",
+            priority=0,
+            min_chars=360,
+            weight=4,
+            line_aware=True,
+        ))
 
     candidate_external_context = _read_candidate_context_files(
         candidate_context_files or [],
         candidate_df,
     )
     if candidate_external_context:
-        sections.append("【候选外部线索】\n" + candidate_external_context)
+        sections.append(_section(
+            "【候选外部线索】\n" + candidate_external_context,
+            kind="candidate_external_context",
+            priority=1,
+            min_chars=320,
+            weight=4,
+            line_aware=True,
+        ))
 
     collected_candidate_context = _format_candidate_context_rows(
         candidate_context_rows or [],
         candidate_df,
     )
     if collected_candidate_context:
-        sections.append("【候选抓取线索】\n" + collected_candidate_context)
+        sections.append(_section(
+            "【候选抓取线索】\n" + collected_candidate_context,
+            kind="candidate_collected_context",
+            priority=1,
+            min_chars=360,
+            weight=4,
+            line_aware=True,
+        ))
 
     snapshot_context = summarize_snapshot_context(snapshot_df, title="全市场快照")
     if snapshot_context:
-        sections.append(snapshot_context)
+        sections.append(_section(
+            snapshot_context,
+            kind="market_snapshot",
+            priority=4,
+            min_chars=160,
+            weight=2,
+            line_aware=True,
+        ))
 
     candidate_context = summarize_snapshot_context(candidate_df, title="候选池快照")
     if candidate_context:
-        sections.append(candidate_context)
+        sections.append(_section(
+            candidate_context,
+            kind="candidate_snapshot",
+            priority=2,
+            min_chars=180,
+            weight=2,
+            line_aware=True,
+        ))
 
     candidate_profile = summarize_candidate_profile(candidate_df)
     if candidate_profile:
-        sections.append(candidate_profile)
+        sections.append(_section(
+            candidate_profile,
+            kind="candidate_profile",
+            priority=2,
+            min_chars=240,
+            weight=3,
+            line_aware=True,
+        ))
 
-    combined = "\n\n".join(sections).strip()
-    if not combined:
-        return ""
-    if len(combined) <= max_chars:
-        return combined
-    return combined[: max_chars - 20].rstrip() + "\n...[truncated]"
+    return _join_bounded_context_sections(sections, max_chars=max_chars, degradation=degradation)
 
 
 def summarize_snapshot_context(df: pd.DataFrame | None, *, title: str) -> str:
@@ -176,6 +252,40 @@ def summarize_candidate_profile(df: pd.DataFrame | None) -> str:
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
+def summarize_candidate_identity(df: pd.DataFrame | None, *, limit: int = 30) -> str:
+    """Summarize top candidate identities and key ranking fields."""
+    if df is None or df.empty or "code" not in df.columns:
+        return ""
+
+    lines = ["【候选身份】"]
+    for _, row in df.head(max(int(limit), 1)).iterrows():
+        code = _normalize_code(row.get("code", row.get("代码", "")))
+        if not code:
+            continue
+        name = _safe_context_value(
+            row.get("name") or row.get("名称") or row.get("股票名称"),
+            max_len=40,
+        )
+        fields = []
+        score = _safe_context_value(row.get("screen_score"), max_len=24)
+        if score:
+            fields.append(f"screen_score={score}")
+        industry = _safe_context_value(row.get("industry") or row.get("行业"), max_len=40)
+        if industry:
+            fields.append(f"industry={industry}")
+        concepts = _safe_context_value(row.get("concepts") or row.get("概念"), max_len=80)
+        if concepts:
+            fields.append(f"concepts={concepts}")
+        heat = _safe_context_value(row.get("board_heat_score"), max_len=24)
+        if heat:
+            fields.append(f"board_heat_score={heat}")
+        suffix = ": " + ", ".join(fields) if fields else ""
+        lines.append(f"- {code} {name}{suffix}")
+    if len(df) > limit:
+        lines.append(f"...[candidate_identity_omitted:{len(df) - limit}]")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 def summarize_event_profile(event_profile: dict[str, object] | None) -> str:
     """Summarize strategy-level event preferences for the LLM."""
     if not event_profile:
@@ -227,20 +337,22 @@ def _read_candidate_context_files(
     if not paths or candidate_df is None or candidate_df.empty or "code" not in candidate_df.columns:
         return ""
 
-    candidate_names = {
-        _normalize_code(row.get("code", "")): str(row.get("name", "") or "")
-        for _, row in candidate_df.iterrows()
-    }
-    candidate_names = {code: name for code, name in candidate_names.items() if code}
+    candidate_names, candidate_order = _candidate_maps(candidate_df)
     candidate_codes = set(candidate_names)
-    chunks: list[str] = []
+    chunks: list[tuple[int, int, str]] = []
+    row_position = 0
     for path_like in paths:
         path = Path(path_like)
         if not path.is_file():
             raise FileNotFoundError(f"Candidate context file not found: {path}")
         rows = _load_candidate_context_rows(path)
-        chunks.extend(_format_candidate_context_row(row, candidate_codes, candidate_names) for row in rows)
-    return "\n".join(item for item in chunks if item)
+        for row in rows:
+            code = _normalize_code(row.get("code", row.get("代码", "")))
+            item = _format_candidate_context_row(row, candidate_codes, candidate_names)
+            if item:
+                chunks.append((candidate_order.get(code, len(candidate_order)), row_position, item))
+            row_position += 1
+    return "\n".join(item for _, _, item in sorted(chunks))
 
 
 def _format_candidate_context_rows(
@@ -249,17 +361,27 @@ def _format_candidate_context_rows(
 ) -> str:
     if not rows or candidate_df is None or candidate_df.empty or "code" not in candidate_df.columns:
         return ""
-    candidate_names = {
-        _normalize_code(row.get("code", "")): str(row.get("name", "") or "")
-        for _, row in candidate_df.iterrows()
-    }
-    candidate_names = {code: name for code, name in candidate_names.items() if code}
+    candidate_names, candidate_order = _candidate_maps(candidate_df)
     candidate_codes = set(candidate_names)
-    chunks = [
-        _format_candidate_context_row(row, candidate_codes, candidate_names)
-        for row in rows
-    ]
-    return "\n".join(item for item in chunks if item)
+    chunks = []
+    for idx, row in enumerate(rows):
+        code = _normalize_code(row.get("code", row.get("代码", "")))
+        item = _format_candidate_context_row(row, candidate_codes, candidate_names)
+        if item:
+            chunks.append((candidate_order.get(code, len(candidate_order)), idx, item))
+    return "\n".join(item for _, _, item in sorted(chunks))
+
+
+def _candidate_maps(candidate_df: pd.DataFrame) -> tuple[dict[str, str], dict[str, int]]:
+    candidate_names: dict[str, str] = {}
+    candidate_order: dict[str, int] = {}
+    for idx, (_, row) in enumerate(candidate_df.iterrows()):
+        code = _normalize_code(row.get("code", row.get("代码", "")))
+        if not code:
+            continue
+        candidate_names[code] = str(row.get("name", row.get("名称", "")) or "")
+        candidate_order.setdefault(code, idx)
+    return candidate_names, candidate_order
 
 
 def _format_candidate_context_row(
@@ -334,19 +456,157 @@ def _format_profile_value(value: object) -> str:
     return _safe_context_value(value, max_len=280)
 
 
-def _normalize_code(value: object) -> str:
-    text = _safe_context_value(value, max_len=80)
-    if not text:
+def _section(
+    text: str,
+    *,
+    kind: str,
+    priority: int,
+    min_chars: int,
+    weight: int,
+    line_aware: bool = False,
+) -> _ContextSection:
+    return _ContextSection(
+        text=text.strip(),
+        kind=kind,
+        priority=priority,
+        min_chars=max(int(min_chars), 0),
+        weight=max(int(weight), 1),
+        line_aware=line_aware,
+    )
+
+
+def _join_bounded_context_sections(
+    sections: list[_ContextSection],
+    *,
+    max_chars: int,
+    degradation: list[str] | None,
+) -> str:
+    sections = [section for section in sections if section.text.strip()]
+    combined = "\n\n".join(section.text for section in sections).strip()
+    if not combined:
         return ""
-    if text.endswith(".0") and text[:-2].isdigit():
-        text = text[:-2]
-    if text.isdigit():
-        return text.zfill(6)[-6:]
-    match = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
-    if match:
-        return match.group(1)
-    digits = "".join(ch for ch in text if ch.isdigit())
-    return digits.zfill(6)[-6:] if digits else ""
+    if len(combined) <= max_chars:
+        return combined
+
+    marker_line = f"【上下文降级】{_CONTEXT_TRIM_MARKER} low-priority context trimmed."
+    budget = max(int(max_chars) - len(marker_line) - 2, 0)
+    if budget <= 0:
+        return marker_line[:max_chars]
+
+    allocations = _allocate_section_budgets(sections, budget)
+    chunks: list[str] = []
+    trimmed_kinds: list[str] = []
+    for section, limit in zip(sections, allocations, strict=False):
+        trimmed = _trim_section(section, limit)
+        if trimmed:
+            chunks.append(trimmed)
+        if len(trimmed) < len(section.text):
+            trimmed_kinds.append(section.kind)
+
+    result = "\n\n".join(chunks).strip()
+    if trimmed_kinds:
+        trimmed_labels = ",".join(dict.fromkeys(trimmed_kinds))
+        marker_line = (
+            f"【上下文降级】{_CONTEXT_TRIM_MARKER} "
+            f"trimmed={trimmed_labels}"
+        )
+        result = _append_marker_within_limit(result, marker_line, max_chars=max_chars)
+        if degradation is not None:
+            degradation.append(f"LLM context truncated: trimmed={trimmed_labels}")
+    return result[:max_chars]
+
+
+def _allocate_section_budgets(sections: list[_ContextSection], budget: int) -> list[int]:
+    separator_budget = max(len(sections) - 1, 0) * 2
+    body_budget = max(budget - separator_budget, 0)
+    minimums = [min(len(section.text), section.min_chars) for section in sections]
+    minimum_total = sum(minimums)
+    if minimum_total > body_budget:
+        return _priority_floor_allocations(sections, body_budget)
+
+    allocations = list(minimums)
+    remaining = body_budget - minimum_total
+    while remaining > 0:
+        expandable = [
+            idx
+            for idx, section in enumerate(sections)
+            if allocations[idx] < len(section.text)
+        ]
+        if not expandable:
+            break
+        total_weight = sum(sections[idx].weight for idx in expandable)
+        progressed = False
+        for idx in expandable:
+            section = sections[idx]
+            extra = len(section.text) - allocations[idx]
+            share = max(1, int(remaining * section.weight / max(total_weight, 1)))
+            take = min(extra, share, remaining)
+            if take <= 0:
+                continue
+            allocations[idx] += take
+            remaining -= take
+            progressed = True
+            if remaining <= 0:
+                break
+        if not progressed:
+            break
+    return allocations
+
+
+def _priority_floor_allocations(sections: list[_ContextSection], budget: int) -> list[int]:
+    allocations = [0] * len(sections)
+    remaining = max(int(budget), 0)
+    for idx in sorted(range(len(sections)), key=lambda item: sections[item].priority):
+        if remaining <= 0:
+            break
+        section = sections[idx]
+        floor = min(len(section.text), max(section.min_chars, 80))
+        take = min(floor, remaining)
+        allocations[idx] = take
+        remaining -= take
+    return allocations
+
+
+def _trim_section(section: _ContextSection, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    text = section.text
+    if len(text) <= limit:
+        return text
+
+    marker = f"\n...{_CONTEXT_TRIM_MARKER}:{section.kind}"
+    if limit <= len(marker) + 8:
+        return text[:limit].rstrip()
+    content_limit = limit - len(marker)
+    if not section.line_aware:
+        return text[:content_limit].rstrip() + marker
+
+    kept: list[str] = []
+    for line in text.splitlines():
+        candidate = "\n".join([*kept, line]).rstrip() + marker
+        if len(candidate) > limit:
+            prefix = "\n".join(kept).rstrip()
+            separator = "\n" if prefix else ""
+            remaining = limit - len(prefix) - len(separator) - len(marker)
+            if remaining > 8:
+                kept.append(line[:remaining].rstrip())
+            break
+        kept.append(line)
+    if not kept:
+        return text[:content_limit].rstrip() + marker
+    return "\n".join(kept).rstrip() + marker
+
+
+def _append_marker_within_limit(text: str, marker: str, *, max_chars: int) -> str:
+    if not text:
+        return marker[:max_chars]
+    candidate = f"{text}\n{marker}"
+    if len(candidate) <= max_chars:
+        return candidate
+    keep = max(max_chars - len(marker) - 1, 0)
+    if keep <= 0:
+        return marker[:max_chars]
+    return text[:keep].rstrip() + "\n" + marker
 
 
 def _format_extremes(df: pd.DataFrame, change: pd.Series, *, ascending: bool) -> str:

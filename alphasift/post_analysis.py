@@ -7,7 +7,6 @@ external HTTP scoring tool without making DSA part of the core selection path.
 
 from __future__ import annotations
 
-import re
 from dataclasses import asdict
 
 import requests
@@ -15,6 +14,11 @@ import requests
 from alphasift.config import Config
 from alphasift.dsa import analyze_picks_with_dsa, apply_dsa_overlay
 from alphasift.models import Pick
+from alphasift.normalize import (
+    normalize_code as _normalize_code,
+    safe_float as _safe_float,
+    safe_string_list as _safe_string_list,
+)
 
 SUPPORTED_POST_ANALYZERS = {"dsa", "scorecard", "external_http"}
 _DEFAULT_SCORECARD_PROFILE = {
@@ -314,36 +318,6 @@ def _record_post_result(
         pick.risk_flags = _unique([*pick.risk_flags, *risk_flags])
     if tags:
         pick.post_analysis_tags = _unique([*pick.post_analysis_tags, *tags])
-
-
-def _safe_float(value, default: float) -> float:
-    try:
-        if value is None or value == "":
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _normalize_code(value: object) -> str:
-    text = "" if value is None else str(value).strip()
-    if not text or text.lower() in {"nan", "none", "<na>"}:
-        return ""
-    if text.endswith(".0") and text[:-2].isdigit():
-        text = text[:-2]
-    if text.isdigit():
-        return text.zfill(6)[-6:]
-    match = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
-    if match:
-        return match.group(1)
-    digits = "".join(ch for ch in text if ch.isdigit())
-    return digits.zfill(6)[-6:] if digits else ""
-
-
-def _safe_string_list(value) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [str(item).strip() for item in value if str(item).strip()]
 
 
 def _unique(items: list[str]) -> list[str]:

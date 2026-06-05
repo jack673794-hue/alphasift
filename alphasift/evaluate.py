@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -12,8 +12,11 @@ import pandas as pd
 from alphasift.config import Config
 from alphasift.daily import fetch_daily_history
 from alphasift.models import EvaluationResult, PickEvaluation, ScreenResult
+from alphasift.normalize import normalize_code as _normalize_code
 from alphasift.snapshot import fetch_snapshot_with_fallback
 from alphasift.store import list_saved_runs, load_screen_result
+
+_PRICE_PATH_FETCH_MAX_WORKERS = 8
 
 
 def evaluate_saved_run(
@@ -34,7 +37,10 @@ def evaluate_saved_run(
 
     run = load_screen_result(run_ref, data_dir=config.data_dir)
     if current_snapshot is None:
-        current_snapshot = fetch_snapshot_with_fallback(config.snapshot_source_priority)
+        current_snapshot = fetch_snapshot_with_fallback(
+            config.snapshot_source_priority,
+            fallback_snapshot_path=config.fallback_snapshot_path,
+        )
     if cost_bps is None:
         cost_bps = config.evaluation_cost_bps
     if follow_through_pct is None:
@@ -61,6 +67,8 @@ def evaluate_saved_run(
             lookback_days=price_path_lookback_days,
             source=config.daily_source,
             retries=config.daily_fetch_retries,
+            cache_dir=_daily_history_cache_dir(config),
+            cache_ttl_seconds=_daily_history_cache_ttl_seconds(config),
         )
         effective_price_paths.update(fetched_paths)
 
@@ -231,7 +239,10 @@ def evaluate_saved_runs(
     if config is None:
         config = Config.from_env()
     if current_snapshot is None:
-        current_snapshot = fetch_snapshot_with_fallback(config.snapshot_source_priority)
+        current_snapshot = fetch_snapshot_with_fallback(
+            config.snapshot_source_priority,
+            fallback_snapshot_path=config.fallback_snapshot_path,
+        )
     if cost_bps is None:
         cost_bps = config.evaluation_cost_bps
     if follow_through_pct is None:
@@ -243,9 +254,11 @@ def evaluate_saved_runs(
     if price_path_lookback_days is None:
         price_path_lookback_days = config.evaluation_price_path_lookback_days
 
-    run_items = list_saved_runs(data_dir=config.data_dir, limit=max(int(limit), 1))
-    if strategy:
-        run_items = [item for item in run_items if item.get("strategy") == strategy]
+    run_items = list_saved_runs(
+        data_dir=config.data_dir,
+        limit=max(int(limit), 1),
+        strategy=strategy,
+    )
 
     evaluations: list[EvaluationResult] = []
     for item in run_items:
@@ -327,21 +340,6 @@ def _snapshot_by_code(snapshot: pd.DataFrame) -> dict[str, float]:
     return result
 
 
-def _normalize_code(value: object) -> str:
-    text = "" if value is None else str(value).strip()
-    if not text or text.lower() in {"nan", "none", "<na>"}:
-        return ""
-    if text.endswith(".0") and text[:-2].isdigit():
-        text = text[:-2]
-    if text.isdigit():
-        return text.zfill(6)[-6:]
-    match = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
-    if match:
-        return match.group(1)
-    digits = "".join(ch for ch in text if ch.isdigit())
-    return digits.zfill(6)[-6:] if digits else ""
-
-
 def _normalize_price_path_mapping(
     price_paths: dict[str, pd.DataFrame] | None,
 ) -> dict[str, pd.DataFrame]:
@@ -361,23 +359,58 @@ def _fetch_price_paths(
     lookback_days: int,
     source: str,
     retries: int,
+    cache_dir: str | Path | None = None,
+    cache_ttl_seconds: float | None = None,
 ) -> tuple[dict[str, pd.DataFrame], list[str]]:
     paths: dict[str, pd.DataFrame] = {}
     errors: list[str] = []
+    fetch_codes: list[str] = []
+    seen_codes = set(existing)
     for pick in run.picks:
         code = _normalize_code(pick.code)
-        if not code or code in existing or code in paths:
+        if not code or code in seen_codes:
             continue
+        seen_codes.add(code)
+        fetch_codes.append(code)
+
+    def fetch_one(code: str) -> tuple[str, pd.DataFrame | None, str | None]:
         try:
-            paths[code] = fetch_daily_history(
+            return code, fetch_daily_history(
                 code,
                 lookback_days=lookback_days,
                 source=source,
                 retries=retries,
-            )
+                cache_dir=cache_dir,
+                cache_ttl_seconds=cache_ttl_seconds,
+            ), None
         except Exception as exc:
-            errors.append(f"Price path fetch failed for {code}: {exc}")
+            return code, None, f"Price path fetch failed for {code}: {exc}"
+
+    if len(fetch_codes) <= 1:
+        fetched_rows = [fetch_one(code) for code in fetch_codes]
+    else:
+        max_workers = min(_PRICE_PATH_FETCH_MAX_WORKERS, len(fetch_codes))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            fetched_rows = list(executor.map(fetch_one, fetch_codes))
+
+    for code, path, error in fetched_rows:
+        if error:
+            errors.append(error)
+        elif path is not None:
+            paths[code] = path
     return paths, errors
+
+
+def _daily_history_cache_dir(config: Config) -> Path | None:
+    configured = getattr(config, "daily_history_cache_dir", None)
+    if configured is not None:
+        return Path(configured)
+    return Path(config.data_dir) / "daily_history"
+
+
+def _daily_history_cache_ttl_seconds(config: Config) -> float:
+    hours = getattr(config, "daily_history_cache_ttl_hours", 24)
+    return max(0.0, float(hours)) * 60 * 60
 
 
 def _price_path_metrics(

@@ -2,7 +2,6 @@
 """Main pipeline — orchestrates L1 → L2 → result."""
 
 import logging
-import re
 import uuid
 from pathlib import Path
 
@@ -16,6 +15,13 @@ from alphasift.dsa_provider import apply_dsa_provider_context
 from alphasift.filter import apply_hard_filters, requires_daily_features, without_daily_filters
 from alphasift.industry import enrich_industry_concepts
 from alphasift.models import Pick, ScreenResult
+from alphasift.normalize import (
+    normalize_code as _normalize_code,
+    safe_bool as _safe_bool,
+    safe_float as _safe_float,
+    safe_int as _safe_int,
+    safe_text,
+)
 from alphasift.post_analysis import normalize_post_analyzers, run_post_analyzers
 from alphasift.ranker import rank_candidates_with_metadata
 from alphasift.risk import apply_portfolio_overlay, apply_risk_overlay
@@ -118,6 +124,7 @@ def screen(
     snapshot_df = fetch_snapshot_with_fallback(
         config.snapshot_source_priority,
         required_columns=_required_snapshot_columns(snapshot_filters),
+        fallback_snapshot_path=config.fallback_snapshot_path,
     )
     effective_industry_map_files = (
         list(industry_map_files)
@@ -136,12 +143,22 @@ def screen(
             map_files=effective_industry_map_files,
             provider=effective_industry_provider,
             max_boards=config.industry_provider_max_boards,
+            provider_cache_dir=config.industry_provider_cache_dir,
+            provider_cache_ttl_hours=config.industry_provider_cache_ttl_hours,
         )
         degradation.extend(f"Industry/concepts enrichment: {item}" for item in industry_notes)
     snapshot_count = len(snapshot_df)
     snapshot_source = str(snapshot_df.attrs.get("snapshot_source", ""))
     source_errors = [str(item) for item in snapshot_df.attrs.get("source_errors", [])]
     degradation.extend(f"Snapshot source fallback: {item}" for item in source_errors)
+    if bool(snapshot_df.attrs.get("fallback_used")):
+        stale_age = snapshot_df.attrs.get("stale_age_hours")
+        if stale_age is None:
+            degradation.append("Snapshot source fallback: last_good_cache stale")
+        else:
+            degradation.append(
+                f"Snapshot source fallback: last_good_cache stale_age_hours={stale_age}"
+            )
 
     # 3. L1 hard filter. If a strategy needs daily features, first apply only
     # snapshot-safe filters, then enrich a narrowed candidate pool.
@@ -290,6 +307,7 @@ def screen(
                     else ""
                 )
                 degradation.append(f"Candidate context row errors: {sample}{suffix}")
+        llm_context_degradation: list[str] = []
         effective_context = build_llm_context(
             base_context=llm_context if llm_context is not None else config.llm_context,
             context_files=llm_context_files,
@@ -299,7 +317,10 @@ def screen(
             candidate_df=df_top,
             event_profile=screening.event_profile,
             max_chars=config.llm_context_max_chars,
+            degradation=llm_context_degradation,
         )
+        degradation.extend(llm_context_degradation)
+        llm_prompt_degradation: list[str] = []
         llm_result = rank_candidates_with_metadata(
             picks,
             screening.ranking_hints,
@@ -317,7 +338,9 @@ def screen(
             channels=config.llm_channels,
             config_path=str(config.llm_config_path or ""),
             timeout_sec=config.llm_timeout_sec,
+            degradation=llm_prompt_degradation,
         )
+        degradation.extend(llm_prompt_degradation)
         picks = llm_result.picks
         llm_market_view = llm_result.market_view
         llm_selection_logic = llm_result.selection_logic
@@ -479,30 +502,6 @@ def _required_snapshot_columns(filters) -> list[str]:
     return list(dict.fromkeys(columns))
 
 
-def _safe_float(v) -> float | None:
-    if v is None or v == "" or v == "-":
-        return None
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
-
-
-def _safe_int(v) -> int | None:
-    numeric = _safe_float(v)
-    if numeric is None:
-        return None
-    return int(numeric)
-
-
-def _safe_bool(v) -> bool | None:
-    if v is None or v == "":
-        return None
-    if isinstance(v, bool):
-        return v
-    return str(v).strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _event_source_weights(event_profile: dict[str, object]) -> dict[str, float] | None:
     value = (event_profile or {}).get("source_weights")
     if not isinstance(value, dict):
@@ -516,25 +515,5 @@ def _event_source_weights(event_profile: dict[str, object]) -> dict[str, float] 
     return result or None
 
 
-def _safe_text(v) -> str:
-    if v is None:
-        return ""
-    text = str(v).strip()
-    if text.lower() in {"nan", "none", "<na>"}:
-        return ""
-    return text[:120]
-
-
-def _normalize_code(value: object) -> str:
-    text = _safe_text(value)
-    if not text:
-        return ""
-    if text.endswith(".0") and text[:-2].isdigit():
-        text = text[:-2]
-    if text.isdigit():
-        return text.zfill(6)[-6:]
-    match = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
-    if match:
-        return match.group(1)
-    digits = "".join(ch for ch in text if ch.isdigit())
-    return digits.zfill(6)[-6:] if digits else ""
+def _safe_text(v: object) -> str:
+    return safe_text(v, max_len=120)
