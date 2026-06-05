@@ -56,6 +56,8 @@ def enrich_industry_concepts(
     map_files: list[str | Path] | None = None,
     provider: str = "none",
     max_boards: int = 80,
+    provider_cache_dir: str | Path | None | object = _CACHE_DIR_UNSET,
+    provider_cache_ttl_hours: float | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Attach industry/concepts columns from stable files and optional providers."""
     result = df.copy()
@@ -87,7 +89,11 @@ def enrich_industry_concepts(
 
     if provider and provider.lower() not in {"", "none", "off", "false"}:
         if provider.lower() == "akshare":
-            provider_mapping, provider_notes = fetch_akshare_board_map(max_boards=max_boards)
+            provider_mapping, provider_notes = fetch_akshare_board_map(
+                max_boards=max_boards,
+                cache_dir=provider_cache_dir,
+                cache_ttl_hours=provider_cache_ttl_hours,
+            )
             _merge_mapping(mapping, provider_mapping)
             notes.extend(provider_notes)
         else:

@@ -143,6 +143,8 @@ def screen(
             map_files=effective_industry_map_files,
             provider=effective_industry_provider,
             max_boards=config.industry_provider_max_boards,
+            provider_cache_dir=config.industry_provider_cache_dir,
+            provider_cache_ttl_hours=config.industry_provider_cache_ttl_hours,
         )
         degradation.extend(f"Industry/concepts enrichment: {item}" for item in industry_notes)
     snapshot_count = len(snapshot_df)
