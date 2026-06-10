@@ -7,7 +7,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import hashlib
 import json
+import os
 from pathlib import Path
+import threading
 import time
 
 import pandas as pd
@@ -32,9 +34,12 @@ _DAILY_FEATURE_DEFAULTS = {
     "pullback_to_ma20_pct": pd.NA,
     "consolidation_days_20d": pd.NA,
 }
-_DAILY_ENRICH_MAX_WORKERS = 8
+_DAILY_ENRICH_MAX_WORKERS = 1
 _DAILY_HISTORY_CACHE_VERSION = 1
 _DAILY_HISTORY_CACHE_TTL_SECONDS = 24 * 60 * 60
+_DEFAULT_TUSHARE_HTTP_URL = "http://api.waditu.com"
+_BAOSTOCK_LOCK = threading.Lock()
+_BAOSTOCK_OUTAGE_ERROR: str | None = None
 
 
 def enrich_daily_features(
@@ -46,6 +51,7 @@ def enrich_daily_features(
     fetch_retries: int = 2,
     cache_dir: str | Path | None = None,
     cache_ttl_seconds: float | None = None,
+    max_workers: int | None = None,
 ) -> pd.DataFrame:
     """Attach daily technical features to the first ``max_rows`` candidates.
 
@@ -85,8 +91,8 @@ def enrich_daily_features(
     if len(fetch_requests) <= 1:
         fetched_rows = [fetch_one(request) for request in fetch_requests]
     else:
-        max_workers = min(_DAILY_ENRICH_MAX_WORKERS, len(fetch_requests))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        worker_limit = min(_normalize_max_workers(max_workers), len(fetch_requests))
+        with ThreadPoolExecutor(max_workers=worker_limit) as executor:
             fetched_rows = list(executor.map(fetch_one, fetch_requests))
 
     for idx, features, error in fetched_rows:
@@ -113,17 +119,20 @@ def fetch_daily_history(
 ) -> pd.DataFrame:
     """Fetch daily history for one A-share code.
 
-    ``source`` accepts ``akshare``, ``baostock`` or ``auto``. ``auto`` tries
-    akshare first and silently falls back to baostock when akshare fails. This
-    matches the multi-source resilience pattern recommended for A-share data
-    pipelines (DSA-style: free primary + free backup).
+    ``source`` accepts ``akshare``, ``baostock``, ``tushare`` or ``auto``.
+    ``auto`` prefers Tushare when a token is configured, then falls back to
+    akshare and baostock. Without a token it keeps the free-source order.
     """
     normalized_code = _normalize_daily_code(code)
     normalized_lookback_days = int(lookback_days)
     src = _normalize_daily_source(source)
     if src == "auto":
-        sources: tuple[str, ...] = ("akshare", "baostock")
-    elif src in ("akshare", "baostock"):
+        sources: tuple[str, ...] = (
+            ("tushare", "akshare", "baostock")
+            if _has_tushare_token()
+            else ("akshare", "baostock")
+        )
+    elif src in ("akshare", "baostock", "tushare"):
         sources = (src,)
     else:
         raise ValueError(f"Unsupported daily source: {source}")
@@ -148,6 +157,11 @@ def fetch_daily_history(
             try:
                 if current == "akshare":
                     result = _fetch_daily_akshare(
+                        normalized_code,
+                        lookback_days=normalized_lookback_days,
+                    )
+                elif current == "tushare":
+                    result = _fetch_daily_tushare(
                         normalized_code,
                         lookback_days=normalized_lookback_days,
                     )
@@ -191,6 +205,12 @@ def _normalize_daily_code(value: object) -> str:
 
 def _normalize_daily_source(source: str | None) -> str:
     return (source or "akshare").strip().lower()
+
+
+def _normalize_max_workers(value: int | None) -> int:
+    if value is None:
+        return _DAILY_ENRICH_MAX_WORKERS
+    return max(1, int(value))
 
 
 def _daily_history_cache_path(
@@ -281,6 +301,126 @@ def _fetch_daily_akshare(code: str, *, lookback_days: int) -> pd.DataFrame:
     return df.tail(max(lookback_days, 30)).copy()
 
 
+def _fetch_daily_tushare(code: str, *, lookback_days: int) -> pd.DataFrame:
+    """Fetch forward-adjusted daily history via Tushare Pro."""
+    token = _tushare_token()
+    if not token:
+        raise RuntimeError("tushare requires TUSHARE_TOKEN")
+
+    import tushare as ts
+
+    pro = ts.pro_api(token)
+    _configure_tushare_client(pro, token=token)
+
+    start_date = (datetime.now() - timedelta(days=max(lookback_days * 2, 90))).strftime("%Y%m%d")
+    end_date = datetime.now().strftime("%Y%m%d")
+    adj = _normalize_tushare_adj(os.getenv("TUSHARE_DAILY_ADJ", "qfq"))
+    ts_code = _to_tushare_code(code)
+    df = pro.daily(
+        ts_code=ts_code,
+        start_date=start_date,
+        end_date=end_date,
+        fields="ts_code,trade_date,open,high,low,close,vol,amount",
+    )
+    if df is None or df.empty:
+        raise RuntimeError(f"tushare daily history empty for {code}")
+    if adj is not None:
+        df = _apply_tushare_adjustment(
+            df,
+            pro=pro,
+            ts_code=ts_code,
+            start_date=start_date,
+            end_date=end_date,
+            adj=adj,
+        )
+
+    normalized = _normalize_tushare_daily_frame(df)
+    return normalized.tail(max(lookback_days, 30)).copy()
+
+
+def _tushare_token() -> str:
+    return (
+        os.getenv("TUSHARE_TOKEN", "").strip()
+        or os.getenv("TUSHARE_API_TOKEN", "").strip()
+    )
+
+
+def _has_tushare_token() -> bool:
+    return bool(_tushare_token())
+
+
+def _configure_tushare_client(pro: object, *, token: str) -> None:
+    try:
+        setattr(pro, "_DataApi__token", token)
+    except Exception:
+        pass
+
+    http_url = (
+        os.getenv("TUSHARE_API_URL", "").strip()
+        or os.getenv("TUSHARE_HTTP_URL", "").strip()
+        or _DEFAULT_TUSHARE_HTTP_URL
+    )
+    try:
+        setattr(pro, "_DataApi__http_url", http_url)
+    except Exception:
+        pass
+
+
+def _normalize_tushare_daily_frame(df: pd.DataFrame) -> pd.DataFrame:
+    rename_map = {
+        "trade_date": "date",
+        "vol": "volume",
+    }
+    normalized = df.rename(columns=rename_map).copy()
+    if "date" in normalized.columns:
+        normalized["date"] = normalized["date"].astype(str)
+        normalized = normalized.sort_values("date")
+    return normalized
+
+
+def _apply_tushare_adjustment(
+    df: pd.DataFrame,
+    *,
+    pro: object,
+    ts_code: str,
+    start_date: str,
+    end_date: str,
+    adj: str,
+) -> pd.DataFrame:
+    factors = pro.adj_factor(
+        ts_code=ts_code,
+        start_date=start_date,
+        end_date=end_date,
+        fields="trade_date,adj_factor",
+    )
+    if factors is None or factors.empty:
+        raise RuntimeError(f"tushare adj_factor empty for {ts_code}")
+
+    merged = df.merge(factors, on="trade_date", how="left")
+    merged = merged.sort_values("trade_date")
+    merged["adj_factor"] = pd.to_numeric(merged["adj_factor"], errors="coerce").bfill()
+    valid_factors = pd.to_numeric(factors["adj_factor"], errors="coerce").dropna()
+    if valid_factors.empty:
+        raise RuntimeError(f"tushare adj_factor invalid for {ts_code}")
+    latest_factor = float(valid_factors.iloc[0])
+    for col in ("open", "high", "low", "close"):
+        merged[col] = pd.to_numeric(merged[col], errors="coerce")
+        if adj == "hfq":
+            merged[col] = merged[col] * merged["adj_factor"]
+        else:
+            merged[col] = merged[col] * merged["adj_factor"] / latest_factor
+    return merged.drop(columns=["adj_factor"])
+
+
+def _normalize_tushare_adj(value: str | None) -> str | None:
+    text = (value or "").strip().lower()
+    if text in {"", "none", "null", "no", "false", "0"}:
+        return None
+    if text not in {"qfq", "hfq"}:
+        raise RuntimeError(f"unsupported TUSHARE_DAILY_ADJ: {value}")
+    return text
+
+
 def _fetch_daily_baostock(code: str, *, lookback_days: int) -> pd.DataFrame:
     """Fetch daily history via Baostock as a free fallback source.
 
@@ -292,27 +432,46 @@ def _fetch_daily_baostock(code: str, *, lookback_days: int) -> pd.DataFrame:
     except ImportError as exc:
         raise RuntimeError("baostock not installed; pip install baostock") from exc
 
+    global _BAOSTOCK_OUTAGE_ERROR
+    if _BAOSTOCK_OUTAGE_ERROR is not None:
+        raise RuntimeError(_BAOSTOCK_OUTAGE_ERROR)
+
     bs_code = _to_baostock_code(code)
     start_date = (datetime.now() - timedelta(days=max(lookback_days * 2, 90))).strftime("%Y-%m-%d")
     end_date = datetime.now().strftime("%Y-%m-%d")
 
-    bs.login()
-    try:
-        rs = bs.query_history_k_data_plus(
-            bs_code,
-            "date,open,high,low,close,volume,amount",
-            start_date=start_date,
-            end_date=end_date,
-            frequency="d",
-            adjustflag="2",
-        )
-        if rs.error_code != "0":
-            raise RuntimeError(f"baostock error {rs.error_code}: {rs.error_msg}")
-        rows = []
-        while rs.next():
-            rows.append(rs.get_row_data())
-    finally:
-        bs.logout()
+    with _BAOSTOCK_LOCK:
+        if _BAOSTOCK_OUTAGE_ERROR is not None:
+            raise RuntimeError(_BAOSTOCK_OUTAGE_ERROR)
+
+        login_result = bs.login()
+        try:
+            login_error_code = str(getattr(login_result, "error_code", "0"))
+            if login_error_code not in {"", "0"}:
+                login_error_msg = getattr(login_result, "error_msg", "")
+                raise RuntimeError(f"baostock login error {login_error_code}: {login_error_msg}")
+
+            rs = bs.query_history_k_data_plus(
+                bs_code,
+                "date,open,high,low,close,volume,amount",
+                start_date=start_date,
+                end_date=end_date,
+                frequency="d",
+                adjustflag="2",
+            )
+            if rs.error_code != "0":
+                message = f"baostock error {rs.error_code}: {rs.error_msg}"
+                if _is_baostock_network_outage(rs.error_code, rs.error_msg):
+                    _BAOSTOCK_OUTAGE_ERROR = message
+                raise RuntimeError(message)
+            rows = []
+            while rs.next():
+                rows.append(rs.get_row_data())
+        finally:
+            try:
+                bs.logout()
+            except Exception:
+                pass
 
     if not rows:
         raise RuntimeError(f"baostock daily history empty for {code}")
@@ -326,6 +485,21 @@ def _to_baostock_code(code: str) -> str:
     if raw.startswith(("6", "9", "5")):
         return f"sh.{raw}"
     return f"sz.{raw}"
+
+
+def _to_tushare_code(code: str) -> str:
+    raw = str(code).strip().zfill(6)
+    if raw.startswith(("4", "8", "920")):
+        return f"{raw}.BJ"
+    if raw.startswith(("6", "9", "5")):
+        return f"{raw}.SH"
+    return f"{raw}.SZ"
+
+
+def _is_baostock_network_outage(error_code: object, error_msg: object) -> bool:
+    code = str(error_code)
+    message = str(error_msg)
+    return code in {"10002007"} or "网络" in message or "接收" in message
 
 
 def compute_daily_features(hist: pd.DataFrame) -> dict[str, object]:

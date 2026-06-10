@@ -17,6 +17,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 _SNAPSHOT_CACHE_VERSION = 1
+_DEFAULT_TUSHARE_HTTP_URL = "http://api.waditu.com"
 
 
 def fetch_cn_snapshot(source: str = "efinance") -> pd.DataFrame:
@@ -270,6 +271,7 @@ def _fetch_tushare() -> pd.DataFrame:
     import tushare as ts
 
     pro = ts.pro_api(token)
+    _configure_tushare_client(pro, token=token)
     trade_date = _resolve_tushare_trade_date(pro)
     daily = pro.daily(
         trade_date=trade_date,
@@ -291,6 +293,23 @@ def _fetch_tushare() -> pd.DataFrame:
         raise RuntimeError(f"tushare daily_basic returned empty data for {trade_date}")
 
     return _prepare_tushare_snapshot(daily, daily_basic, stock_basic)
+
+
+def _configure_tushare_client(pro: object, *, token: str) -> None:
+    try:
+        setattr(pro, "_DataApi__token", token)
+    except Exception:
+        pass
+
+    http_url = (
+        os.getenv("TUSHARE_API_URL", "").strip()
+        or os.getenv("TUSHARE_HTTP_URL", "").strip()
+        or _DEFAULT_TUSHARE_HTTP_URL
+    )
+    try:
+        setattr(pro, "_DataApi__http_url", http_url)
+    except Exception:
+        pass
 
 
 def _resolve_tushare_trade_date(pro) -> str:

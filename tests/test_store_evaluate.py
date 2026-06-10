@@ -353,7 +353,7 @@ def test_evaluate_saved_runs_uses_parallel_price_path_fetch_without_order_drift(
     monkeypatch.setattr("alphasift.evaluate.fetch_daily_history", fake_fetch_daily_history)
 
     aggregate = evaluate_saved_runs(
-        config=Config(llm_api_key="", data_dir=tmp_path),
+        config=Config(llm_api_key="", data_dir=tmp_path, daily_fetch_max_workers=2),
         current_snapshot=snapshot,
         limit=10,
         cost_bps=0,
@@ -361,7 +361,7 @@ def test_evaluate_saved_runs_uses_parallel_price_path_fetch_without_order_drift(
     )
     evaluation = evaluate_saved_run(
         "run_parallel",
-        config=Config(llm_api_key="", data_dir=tmp_path),
+        config=Config(llm_api_key="", data_dir=tmp_path, daily_fetch_max_workers=2),
         current_snapshot=snapshot,
         cost_bps=0,
         with_price_path=True,

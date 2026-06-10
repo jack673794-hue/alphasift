@@ -74,8 +74,9 @@ TUSHARE_TOKEN=...
 | `DAILY_ENRICH_ENABLED` | 否 | 是否默认对 L1 后 Top N 候选补充日 K 特征 | `false` |
 | `DAILY_ENRICH_MAX_CANDIDATES` | 否 | 日 K 增强最多处理候选数 | `100` |
 | `DAILY_LOOKBACK_DAYS` | 否 | 日 K 特征回看天数 | `120` |
-| `DAILY_SOURCE` | 否 | 日 K 数据源：`akshare`、`baostock` 或 `auto`（akshare 主源 + baostock 免费兜底） | `akshare` |
+| `DAILY_SOURCE` | 否 | 日 K 数据源：`akshare`、`baostock`、`tushare` 或 `auto`；有 Tushare token 时 `auto` 优先用 `tushare` | `akshare` |
 | `DAILY_FETCH_RETRIES` | 否 | 单只候选日 K 拉取失败后的重试次数 | `2` |
+| `DAILY_FETCH_MAX_WORKERS` | 否 | 日 K 拉取并发数，网络不稳时建议 `1`，稳定后可设 `2`/`4` | `1` |
 | `RISK_ENABLED` | 否 | 是否启用独立风险层 | `true` |
 | `RISK_MAX_PENALTY` | 否 | 风险层最大扣分 | `12` |
 | `RISK_VETO_HIGH` | 否 | 是否直接剔除高风险候选 | `false` |

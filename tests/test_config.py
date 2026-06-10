@@ -64,6 +64,14 @@ def test_config_reads_daily_fetch_retries(monkeypatch):
     assert config.daily_fetch_retries == 4
 
 
+def test_config_reads_daily_fetch_max_workers(monkeypatch):
+    monkeypatch.setenv("DAILY_FETCH_MAX_WORKERS", "3")
+
+    config = Config.from_env()
+
+    assert config.daily_fetch_max_workers == 3
+
+
 def test_config_defaults_daily_history_cache_under_data_dir(monkeypatch, tmp_path):
     monkeypatch.setenv("ALPHASIFT_DATA_DIR", str(tmp_path))
     monkeypatch.delenv("ALPHASIFT_FALLBACK_SNAPSHOT_PATH", raising=False)

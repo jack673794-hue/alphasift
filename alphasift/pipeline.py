@@ -196,6 +196,7 @@ def screen(
                 lookback_days=config.daily_lookback_days,
                 source=config.daily_source,
                 fetch_retries=config.daily_fetch_retries,
+                max_workers=config.daily_fetch_max_workers,
             )
             daily_enriched = True
             daily_errors = [str(item) for item in enriched.attrs.get("daily_errors", [])]

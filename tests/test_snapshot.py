@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 
 from alphasift.snapshot import (
+    _configure_tushare_client,
     _normalize,
     _prepare_tushare_snapshot,
     fetch_cn_snapshot,
@@ -100,6 +101,19 @@ def test_fetch_tushare_requires_token(monkeypatch):
 
     with pytest.raises(RuntimeError, match="TUSHARE_TOKEN"):
         fetch_cn_snapshot("tushare")
+
+
+def test_configure_tushare_client_reads_http_url(monkeypatch):
+    class FakePro:
+        pass
+
+    monkeypatch.setenv("TUSHARE_API_URL", "http://example.test")
+    pro = FakePro()
+
+    _configure_tushare_client(pro, token="token")
+
+    assert pro._DataApi__token == "token"
+    assert pro._DataApi__http_url == "http://example.test"
 
 
 def test_fetch_snapshot_with_fallback_attaches_source_errors(monkeypatch):

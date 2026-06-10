@@ -16,8 +16,6 @@ from alphasift.normalize import normalize_code as _normalize_code
 from alphasift.snapshot import fetch_snapshot_with_fallback
 from alphasift.store import list_saved_runs, load_screen_result
 
-_PRICE_PATH_FETCH_MAX_WORKERS = 8
-
 
 def evaluate_saved_run(
     run_ref: str | Path,
@@ -67,6 +65,7 @@ def evaluate_saved_run(
             lookback_days=price_path_lookback_days,
             source=config.daily_source,
             retries=config.daily_fetch_retries,
+            max_workers=config.daily_fetch_max_workers,
             cache_dir=_daily_history_cache_dir(config),
             cache_ttl_seconds=_daily_history_cache_ttl_seconds(config),
         )
@@ -359,6 +358,7 @@ def _fetch_price_paths(
     lookback_days: int,
     source: str,
     retries: int,
+    max_workers: int = 1,
     cache_dir: str | Path | None = None,
     cache_ttl_seconds: float | None = None,
 ) -> tuple[dict[str, pd.DataFrame], list[str]]:
@@ -389,8 +389,8 @@ def _fetch_price_paths(
     if len(fetch_codes) <= 1:
         fetched_rows = [fetch_one(code) for code in fetch_codes]
     else:
-        max_workers = min(_PRICE_PATH_FETCH_MAX_WORKERS, len(fetch_codes))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        worker_limit = min(max(1, int(max_workers)), len(fetch_codes))
+        with ThreadPoolExecutor(max_workers=worker_limit) as executor:
             fetched_rows = list(executor.map(fetch_one, fetch_codes))
 
     for code, path, error in fetched_rows:

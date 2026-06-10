@@ -216,6 +216,7 @@ class Config:
     daily_lookback_days: int = 120
     daily_source: str = "akshare"
     daily_fetch_retries: int = 2
+    daily_fetch_max_workers: int = 1
     daily_history_cache_dir: Path | None = None
     daily_history_cache_ttl_hours: int = 24
 
@@ -340,6 +341,7 @@ class Config:
             daily_lookback_days=max(30, int(os.getenv("DAILY_LOOKBACK_DAYS", "120"))),
             daily_source=os.getenv("DAILY_SOURCE", "akshare"),
             daily_fetch_retries=max(0, int(os.getenv("DAILY_FETCH_RETRIES", "2"))),
+            daily_fetch_max_workers=max(1, int(os.getenv("DAILY_FETCH_MAX_WORKERS", "1"))),
             daily_history_cache_dir=daily_history_cache_dir,
             daily_history_cache_ttl_hours=max(
                 0,
