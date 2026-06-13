@@ -64,6 +64,14 @@ def test_config_reads_daily_fetch_retries(monkeypatch):
     assert config.daily_fetch_retries == 4
 
 
+def test_config_defaults_daily_source_to_auto(monkeypatch):
+    monkeypatch.delenv("DAILY_SOURCE", raising=False)
+
+    config = Config.from_env()
+
+    assert config.daily_source == "auto"
+
+
 def test_config_reads_daily_fetch_max_workers(monkeypatch):
     monkeypatch.setenv("DAILY_FETCH_MAX_WORKERS", "3")
 
@@ -142,6 +150,7 @@ def test_config_prefers_tushare_when_token_is_configured(monkeypatch):
 
     assert config.snapshot_source_priority == [
         "tushare",
+        "sina",
         "efinance",
         "akshare_em",
         "em_datacenter",
@@ -156,9 +165,23 @@ def test_config_omits_tushare_from_default_priority_without_token(monkeypatch):
     config = Config.from_env()
 
     assert config.snapshot_source_priority == [
+        "sina",
         "efinance",
         "akshare_em",
         "em_datacenter",
+    ]
+
+
+def test_config_defaults_candidate_context_providers_include_quote(monkeypatch):
+    monkeypatch.delenv("LLM_CANDIDATE_CONTEXT_PROVIDERS", raising=False)
+
+    config = Config.from_env()
+
+    assert config.llm_candidate_context_providers == [
+        "news",
+        "fund_flow",
+        "announcement",
+        "quote",
     ]
 
 

@@ -5,12 +5,25 @@ import pandas as pd
 import pytest
 
 from alphasift.snapshot import (
+    _SOURCE_HEALTH,
     _configure_tushare_client,
+    _eastmoney_get,
+    _fetch_sina,
     _normalize,
     _prepare_tushare_snapshot,
+    _record_source_failure,
+    _record_source_success,
+    _source_disabled_reason,
     fetch_cn_snapshot,
     fetch_snapshot_with_fallback,
 )
+
+
+@pytest.fixture(autouse=True)
+def clear_snapshot_source_health():
+    _SOURCE_HEALTH.clear()
+    yield
+    _SOURCE_HEALTH.clear()
 
 
 def test_normalize_efinance_maps_pb_ratio():
@@ -40,6 +53,106 @@ def test_normalize_efinance_maps_pb_ratio():
     assert normalized.loc[0, "pe_ratio"] == 5.2
     assert normalized.loc[0, "industry"] == "银行"
     assert normalized.loc[0, "concepts"] == "中特估,低估值"
+
+
+def test_normalize_sina_maps_valuation_and_turnover_fields():
+    df = pd.DataFrame([
+        {
+            "code": "000001",
+            "name": "平安银行",
+            "trade": "10.00",
+            "changepercent": "1.23",
+            "amount": "123456789",
+            "mktcap": "1000000000",
+            "nmc": "800000000",
+            "per": "5.2",
+            "pb": "0.8",
+            "turnoverratio": "2.5",
+        }
+    ])
+
+    normalized = _normalize(df, source="sina")
+
+    assert normalized.loc[0, "code"] == "000001"
+    assert normalized.loc[0, "price"] == 10.0
+    assert normalized.loc[0, "change_pct"] == 1.23
+    assert normalized.loc[0, "amount"] == pytest.approx(123456789)
+    assert normalized.loc[0, "total_mv"] == pytest.approx(1000000000)
+    assert normalized.loc[0, "circ_mv"] == pytest.approx(800000000)
+    assert normalized.loc[0, "pe_ratio"] == 5.2
+    assert normalized.loc[0, "pb_ratio"] == 0.8
+    assert normalized.loc[0, "turnover_rate"] == 2.5
+    assert normalized.attrs["snapshot_source"] == "sina"
+
+
+def test_fetch_sina_paginates_and_normalizes_market_cap_units(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    def fake_get(url, **kwargs):
+        calls.append(kwargs)
+        page = kwargs["params"]["page"]
+        if page == 1:
+            return FakeResponse([
+                {
+                    "code": "000001",
+                    "name": "平安银行",
+                    "trade": "10.00",
+                    "changepercent": "1.23",
+                    "amount": "123456789",
+                    "mktcap": "100000",
+                    "nmc": "80000",
+                    "per": "5.2",
+                    "pb": "0.8",
+                    "turnoverratio": "2.5",
+                }
+            ])
+        return FakeResponse([])
+
+    monkeypatch.setattr("alphasift.snapshot.requests.get", fake_get)
+
+    normalized = _fetch_sina()
+
+    assert calls[0]["params"]["node"] == "hs_a"
+    assert calls[0]["headers"]["Referer"] == "https://vip.stock.finance.sina.com.cn/mkt/"
+    assert normalized.loc[0, "total_mv"] == pytest.approx(1000000000)
+    assert normalized.loc[0, "circ_mv"] == pytest.approx(800000000)
+
+
+def test_eastmoney_get_reuses_session_and_throttles(monkeypatch):
+    events = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            events.append("raise")
+
+    class FakeSession:
+        def get(self, url, **kwargs):
+            events.append((url, kwargs))
+            return FakeResponse()
+
+    times = iter([100.0, 100.1, 100.4])
+    monkeypatch.setattr("alphasift.snapshot._EM_SESSION", FakeSession())
+    monkeypatch.setattr("alphasift.snapshot._EM_LAST_REQUEST_AT", 99.95)
+    monkeypatch.setattr("alphasift.snapshot.time.monotonic", lambda: next(times))
+    monkeypatch.setattr("alphasift.snapshot.time.sleep", lambda seconds: events.append(("sleep", seconds)))
+
+    response = _eastmoney_get("https://example.test", params={"p": 1})
+
+    assert isinstance(response, FakeResponse)
+    assert events[0][0] == "sleep"
+    assert events[0][1] == pytest.approx(0.2)
+    assert events[1] == ("https://example.test", {"params": {"p": 1}})
+    assert events[2] == "raise"
 
 
 def test_prepare_tushare_snapshot_maps_fields_and_units():
@@ -127,6 +240,38 @@ def test_fetch_snapshot_with_fallback_attaches_source_errors(monkeypatch):
     df = fetch_snapshot_with_fallback(["bad", "good"])
 
     assert df.attrs["source_errors"] == ["bad: bad source"]
+
+
+def test_snapshot_source_health_temporarily_disables_repeated_failures(monkeypatch):
+    monkeypatch.setattr("alphasift.snapshot.time.monotonic", lambda: 200.0)
+
+    _record_source_failure("sina")
+    _record_source_failure("sina")
+    assert _source_disabled_reason("sina") is None
+    _record_source_failure("sina")
+
+    assert "temporarily disabled" in str(_source_disabled_reason("sina"))
+    _record_source_success("sina")
+    assert _source_disabled_reason("sina") is None
+
+
+def test_fetch_snapshot_with_fallback_skips_disabled_sources(monkeypatch):
+    calls = []
+
+    def fake_fetch(source):
+        calls.append(source)
+        return pd.DataFrame([{"code": "000001", "name": "示例", "price": 10.0}])
+
+    monkeypatch.setattr("alphasift.snapshot.fetch_cn_snapshot", fake_fetch)
+    monkeypatch.setattr("alphasift.snapshot.time.monotonic", lambda: 200.0)
+    _record_source_failure("sina")
+    _record_source_failure("sina")
+    _record_source_failure("sina")
+
+    df = fetch_snapshot_with_fallback(["sina", "efinance"])
+
+    assert calls == ["efinance"]
+    assert df.attrs["source_errors"][0].startswith("sina: temporarily disabled")
 
 
 def test_fetch_snapshot_with_fallback_skips_missing_required_columns(monkeypatch):

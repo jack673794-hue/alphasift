@@ -18,6 +18,7 @@ _CANDIDATE_CONTEXT_COLUMNS = {
     "announcements": "公告",
     "fund_flow": "资金流",
     "fundflow": "资金流",
+    "quote": "行情估值",
     "summary": "摘要",
     "context": "上下文",
     "context_summary": "压缩摘要",

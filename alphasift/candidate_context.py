@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+import requests
 
 _NEGATIVE_EVENT_KEYWORDS = {
     "减持": ("减持", "拟减持", "被动减持"),
@@ -38,6 +39,7 @@ _ANNOUNCEMENT_CATEGORY_KEYWORDS = {
 }
 _SOURCE_WEIGHTS = {
     "announcement": 1.0,
+    "quote": 0.85,
     "news": 0.65,
     "fund_flow": 0.75,
 }
@@ -174,6 +176,13 @@ def _collect_candidate_context_row(
                     successful_sources.append("fund_flow")
             except Exception as exc:
                 errors.append(f"{code} fund_flow: {exc}")
+        if "quote" in providers:
+            try:
+                row["quote"] = fetch_stock_quote_summary(code)
+                if row["quote"]:
+                    successful_sources.append("quote")
+            except Exception as exc:
+                errors.append(f"{code} quote: {exc}")
         if any(value for key, value in row.items() if key not in {"code", "name"}):
             row["source_count"] = len(successful_sources)
             row["source_confidence"] = _source_confidence(successful_sources, providers)
@@ -255,6 +264,42 @@ def fetch_stock_fund_flow_summary(code: str) -> str:
             if value:
                 fields.append(f"{name}={value}")
     return _compress_text("，".join(fields[:8]), max_len=420)
+
+
+def fetch_stock_quote_summary(code: str) -> str:
+    """Fetch lightweight Tencent quote/fundamental context for one candidate."""
+    symbol = _tencent_symbol_for_code(code)
+    if not symbol:
+        return ""
+    resp = requests.get(
+        f"https://qt.gtimg.cn/q={symbol}",
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=8,
+    )
+    resp.raise_for_status()
+    text = resp.text or ""
+    if "=\"" not in text:
+        return ""
+    body = text.split("=\"", 1)[1].split("\";", 1)[0]
+    parts = body.split("~")
+    if len(parts) < 46:
+        return ""
+    fields = [
+        ("名称", _part(parts, 1)),
+        ("现价", _part(parts, 3)),
+        ("涨跌幅", _part(parts, 32)),
+        ("最高", _part(parts, 33)),
+        ("最低", _part(parts, 34)),
+        ("成交额万元", _part(parts, 37)),
+        ("换手率", _part(parts, 38)),
+        ("市盈率", _part(parts, 39)),
+        ("总市值亿元", _part(parts, 45)),
+        ("流通市值亿元", _part(parts, 44)),
+    ]
+    return _compress_text(
+        "，".join(f"{name}={value}" for name, value in fields if value),
+        max_len=360,
+    )
 
 
 def classify_context_events(row: dict[str, object]) -> list[str]:
@@ -346,6 +391,21 @@ def _market_for_code(code: str) -> str:
     return ""
 
 
+def _tencent_symbol_for_code(code: str) -> str:
+    code = _normalize_code(code)
+    if code.startswith(("6", "5", "9")):
+        return f"sh{code}"
+    if code.startswith(("0", "3")):
+        return f"sz{code}"
+    if code.startswith(("4", "8", "920")):
+        return f"bj{code}"
+    return ""
+
+
+def _part(parts: list[str], index: int) -> str:
+    return _safe_text(parts[index] if index < len(parts) else "", max_len=80)
+
+
 def _first_value(row: pd.Series, columns: list[str]) -> str:
     for column in columns:
         if column in row.index:
@@ -434,6 +494,7 @@ def _summarize_row_context(row: dict[str, object]) -> str:
         ("news", "新闻"),
         ("announcement", "公告"),
         ("fund_flow", "资金流"),
+        ("quote", "行情估值"),
     ):
         value = _compress_text(row.get(key), max_len=180)
         if value:
@@ -452,7 +513,7 @@ def _summarize_row_context(row: dict[str, object]) -> str:
 
 def _row_text(row: dict[str, object]) -> str:
     fields = []
-    for key in ("news", "announcement", "announcements", "fund_flow", "summary", "context", "text"):
+    for key in ("news", "announcement", "announcements", "fund_flow", "quote", "summary", "context", "text"):
         value = row.get(key)
         if value:
             fields.append(str(value))
@@ -467,6 +528,8 @@ def _successful_sources_from_row(row: dict[str, object]) -> list[str]:
         sources.append("announcement")
     if row.get("fund_flow") or row.get("fundflow"):
         sources.append("fund_flow")
+    if row.get("quote"):
+        sources.append("quote")
     return sources
 
 

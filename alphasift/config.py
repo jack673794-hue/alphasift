@@ -9,8 +9,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_POST_ANALYZERS = ["scorecard"]
 DEFAULT_LLM_MODEL = "gemini/gemini-2.5-flash"
-DEFAULT_SNAPSHOT_SOURCE_PRIORITY = ["efinance", "akshare_em", "em_datacenter"]
-TUSHARE_FIRST_SOURCE_PRIORITY = ["tushare", "efinance", "akshare_em", "em_datacenter"]
+DEFAULT_SNAPSHOT_SOURCE_PRIORITY = ["sina", "efinance", "akshare_em", "em_datacenter"]
+TUSHARE_FIRST_SOURCE_PRIORITY = ["tushare", "sina", "efinance", "akshare_em", "em_datacenter"]
 _ENV_FILE_CACHE: dict[Path, tuple[tuple[int, int], dict[str, str]]] = {}
 _APPLIED_ENV_FILE_VALUES: dict[str, str] = {}
 
@@ -159,7 +159,7 @@ class Config:
     llm_context: str = ""
     llm_candidate_context_enabled: bool = False
     llm_candidate_context_max_candidates: int = 8
-    llm_candidate_context_providers: list[str] = field(default_factory=lambda: ["news", "fund_flow", "announcement"])
+    llm_candidate_context_providers: list[str] = field(default_factory=lambda: ["news", "fund_flow", "announcement", "quote"])
     llm_candidate_context_news_limit: int = 3
     llm_candidate_context_announcement_limit: int = 3
     llm_candidate_context_cache_enabled: bool = True
@@ -214,7 +214,7 @@ class Config:
     daily_enrich_enabled: bool = False
     daily_enrich_max_candidates: int = 100
     daily_lookback_days: int = 120
-    daily_source: str = "akshare"
+    daily_source: str = "auto"
     daily_fetch_retries: int = 2
     daily_fetch_max_workers: int = 1
     daily_history_cache_dir: Path | None = None
@@ -285,7 +285,7 @@ class Config:
             ),
             llm_candidate_context_providers=_parse_csv_env(
                 "LLM_CANDIDATE_CONTEXT_PROVIDERS",
-                ["news", "fund_flow", "announcement"],
+                ["news", "fund_flow", "announcement", "quote"],
             ),
             llm_candidate_context_news_limit=max(1, int(os.getenv("LLM_CANDIDATE_CONTEXT_NEWS_LIMIT", "3"))),
             llm_candidate_context_announcement_limit=max(
@@ -345,7 +345,7 @@ class Config:
             daily_enrich_enabled=_parse_bool_env("DAILY_ENRICH_ENABLED", False),
             daily_enrich_max_candidates=max(1, int(os.getenv("DAILY_ENRICH_MAX_CANDIDATES", "100"))),
             daily_lookback_days=max(30, int(os.getenv("DAILY_LOOKBACK_DAYS", "120"))),
-            daily_source=os.getenv("DAILY_SOURCE", "akshare"),
+            daily_source=os.getenv("DAILY_SOURCE", "auto"),
             daily_fetch_retries=max(0, int(os.getenv("DAILY_FETCH_RETRIES", "2"))),
             daily_fetch_max_workers=max(1, int(os.getenv("DAILY_FETCH_MAX_WORKERS", "1"))),
             daily_history_cache_dir=daily_history_cache_dir,

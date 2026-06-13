@@ -52,13 +52,13 @@ TUSHARE_TOKEN=...
 | `LLM_CONTEXT_MAX_CHARS` | 否 | 拼接后传给 LLM 的上下文最大长度 | `4000` |
 | `LLM_CANDIDATE_CONTEXT_ENABLED` | 否 | 是否默认对 LLM Top K 候选抓取新闻、公告、资金流线索 | `false` |
 | `LLM_CANDIDATE_CONTEXT_MAX_CANDIDATES` | 否 | 候选级上下文最多抓取前 N 只 | `8` |
-| `LLM_CANDIDATE_CONTEXT_PROVIDERS` | 否 | 候选级抓取来源，逗号分隔：`news,fund_flow,announcement` | `news,fund_flow,announcement` |
+| `LLM_CANDIDATE_CONTEXT_PROVIDERS` | 否 | 候选级抓取来源，逗号分隔：`news,fund_flow,announcement,quote` | `news,fund_flow,announcement,quote` |
 | `LLM_CANDIDATE_CONTEXT_CACHE_ENABLED` | 否 | 是否缓存候选级抓取上下文 | `true` |
 | `LLM_CANDIDATE_CONTEXT_CACHE_TTL_HOURS` | 否 | 候选上下文缓存有效小时数 | `24` |
 | `INDUSTRY_MAP_FILES` | 否 | 本地 code->industry/concepts/board_heat 映射 CSV/JSON/JSONL，逗号分隔 | - |
 | `INDUSTRY_PROVIDER` | 否 | 可选行业、概念、板块热度 provider，如 `akshare`；默认关闭 | `none` |
 | `INDUSTRY_PROVIDER_MAX_BOARDS` | 否 | provider 模式最多反查板块数 | `80` |
-| `SNAPSHOT_SOURCE_PRIORITY` | 否 | 数据源优先级，逗号分隔；不设置时若配置了 Tushare token 会优先 `tushare` | 无 token: `efinance,akshare_em,em_datacenter` |
+| `SNAPSHOT_SOURCE_PRIORITY` | 否 | 数据源优先级，逗号分隔；不设置时若配置了 Tushare token 会优先 `tushare` | 无 token: `sina,efinance,akshare_em,em_datacenter` |
 | `SNAPSHOT_FALLBACK_MAX_AGE_HOURS` | 否 | last-good 快照缓存最大可接受年龄；为空/`none` 表示不限制 | - |
 | `TUSHARE_TOKEN` / `TUSHARE_API_TOKEN` | 使用 `tushare` 时必须 | Tushare Pro token，用于最近交易日日线和 daily_basic 兜底 | - |
 | `TUSHARE_TRADE_DATE` | 否 | 固定 Tushare 交易日，格式 `YYYYMMDD`，便于复现实验 | 自动取最近开市日 |
@@ -75,7 +75,7 @@ TUSHARE_TOKEN=...
 | `DAILY_ENRICH_ENABLED` | 否 | 是否默认对 L1 后 Top N 候选补充日 K 特征 | `false` |
 | `DAILY_ENRICH_MAX_CANDIDATES` | 否 | 日 K 增强最多处理候选数 | `100` |
 | `DAILY_LOOKBACK_DAYS` | 否 | 日 K 特征回看天数 | `120` |
-| `DAILY_SOURCE` | 否 | 日 K 数据源：`akshare`、`baostock`、`tushare` 或 `auto`；有 Tushare token 时 `auto` 优先用 `tushare` | `akshare` |
+| `DAILY_SOURCE` | 否 | 日 K 数据源：`auto`、`tencent`、`akshare`、`baostock` 或 `tushare`；`auto` 有 Tushare token 时使用 `tushare,tencent,akshare,baostock`，否则使用 `tencent,akshare,baostock` | `auto` |
 | `DAILY_FETCH_RETRIES` | 否 | 单只候选日 K 拉取失败后的重试次数 | `2` |
 | `DAILY_FETCH_MAX_WORKERS` | 否 | 日 K 拉取并发数，网络不稳时建议 `1`，稳定后可设 `2`/`4` | `1` |
 | `RISK_ENABLED` | 否 | 是否启用独立风险层 | `true` |
@@ -122,26 +122,36 @@ alphasift --env-file /path/to/daily_stock_analysis/.env \
 
 ## 数据源配置
 
-支持四种 A 股全市场快照数据源，自动按优先级降级。默认未配置 Tushare token 时使用：
+支持五种 A 股全市场快照数据源，自动按优先级降级。默认未配置 Tushare token 时使用：
 
 ```text
-efinance -> akshare_em -> em_datacenter
+sina -> efinance -> akshare_em -> em_datacenter
 ```
 
 若配置了 `TUSHARE_TOKEN` / `TUSHARE_API_TOKEN`，且没有手工设置 `SNAPSHOT_SOURCE_PRIORITY`，默认链路改为：
 
 ```text
-tushare -> efinance -> akshare_em -> em_datacenter
+tushare -> sina -> efinance -> akshare_em -> em_datacenter
 ```
 
 | 数据源 | 接口 | 特点 |
 |--------|------|------|
+| `sina` | vip.stock.finance.sina.com.cn | 直连全市场源，含 PE/PB/换手率/市值字段 |
 | `efinance` | push2.eastmoney.com | 实时推送，交易时段最快 |
 | `akshare_em` | 82.push2.eastmoney.com | 实时推送，备选 |
 | `em_datacenter` | data.eastmoney.com | 选股器 API，非交易时段可用 |
 | `tushare` | Tushare Pro `daily` + `daily_basic` | 最近交易日数据，需 `TUSHARE_TOKEN`，非实时 |
 
-周末或节假日 push2 接口不可用时，会自动降级到 `em_datacenter`。如果某个数据源缺少当前策略必需字段，例如 PB，系统会跳过该源继续尝试后续来源。所有实时源失败时可读取 `snapshot.last_good.json`，并标记 `fallback_used/stale/stale_age_hours/source_errors`；如设置 `SNAPSHOT_FALLBACK_MAX_AGE_HOURS`，超过该年龄的缓存会被拒绝，避免长期重复使用过旧快照。
+周末或节假日 push2 接口不可用时，会自动降级到 `em_datacenter`。EastMoney 直连接口通过共享会话和轻量限流访问，减少连接抖动和连续降级时的突发请求。重复失败的数据源会进入短期健康度熔断，后续运行会临时跳过该源；日 K live 源全失败时可读取过期但结构有效的 history cache，并用 `daily_stale/source_errors` 标记降级。如果某个数据源缺少当前策略必需字段，例如 PB，系统会跳过该源继续尝试后续来源。所有实时源失败时可读取 `snapshot.last_good.json`，并标记 `fallback_used/stale/stale_age_hours/source_errors`；如设置 `SNAPSHOT_FALLBACK_MAX_AGE_HOURS`，超过该年龄的缓存会被拒绝，避免长期重复使用过旧快照。
+
+### 数据源能力矩阵
+
+| 能力 | 默认链路 | 主要字段 |
+|------|----------|----------|
+| 日 K 增强 | 有 token: `tushare,tencent,akshare,baostock`；无 token: `tencent,akshare,baostock` | OHLCV、前复权、技术指标 |
+| 全市场快照 | 有 token: `tushare,sina,efinance,akshare_em,em_datacenter`；无 token: `sina,efinance,akshare_em,em_datacenter` | 价格、涨跌幅、成交额、市值、PE/PB、换手率 |
+| 候选级上下文 | `news,fund_flow,announcement,quote` | 新闻、资金流、公告、腾讯行情估值/换手率 |
+| 失败降级 | source health 熔断 + daily history cache + snapshot last-good cache | stale/fallback/source_errors 元数据 |
 
 ## L3 后置分析器
 

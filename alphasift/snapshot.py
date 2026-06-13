@@ -8,16 +8,26 @@ This is separate from single-stock realtime quotes.
 import logging
 import json
 import os
+import threading
 import time
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 
 import pandas as pd
+import requests
 
 logger = logging.getLogger(__name__)
 
 _SNAPSHOT_CACHE_VERSION = 1
 _DEFAULT_TUSHARE_HTTP_URL = "http://api.waditu.com"
+_EM_REQUEST_MIN_INTERVAL_SECONDS = 0.25
+_SOURCE_HEALTH_FAILURE_THRESHOLD = 3
+_SOURCE_HEALTH_COOLDOWN_SECONDS = 5 * 60
+_EM_SESSION: requests.Session | None = None
+_EM_LAST_REQUEST_AT = 0.0
+_EM_LOCK = threading.Lock()
+_SOURCE_HEALTH: dict[str, dict[str, float]] = {}
+_SOURCE_HEALTH_LOCK = threading.Lock()
 
 
 def fetch_cn_snapshot(source: str = "efinance") -> pd.DataFrame:
@@ -29,7 +39,9 @@ def fetch_cn_snapshot(source: str = "efinance") -> pd.DataFrame:
 
     Raises RuntimeError if the source is unavailable.
     """
-    if source == "efinance":
+    if source == "sina":
+        return _fetch_sina()
+    elif source == "efinance":
         return _fetch_efinance()
     elif source == "akshare_em":
         return _fetch_akshare_em()
@@ -56,6 +68,10 @@ def fetch_snapshot_with_fallback(
     errors = []
     required = required_columns or []
     for source in sources:
+        disabled_reason = _source_disabled_reason(source)
+        if disabled_reason:
+            errors.append(f"{source}: {disabled_reason}")
+            continue
         try:
             df = fetch_cn_snapshot(source)
             if not df.empty:
@@ -71,11 +87,14 @@ def fetch_snapshot_with_fallback(
                 df.attrs["stale"] = False
                 df.attrs["stale_age_hours"] = None
                 _write_last_good_snapshot(fallback_snapshot_path, df)
+                _record_source_success(source)
                 logger.info("Snapshot fetched from %s: %d rows", source, len(df))
                 return df
             errors.append(f"{source}: returned empty data")
+            _record_source_failure(source)
         except Exception as e:
             errors.append(f"{source}: {e}")
+            _record_source_failure(source)
             logger.warning("Snapshot source %s failed: %s", source, e)
 
     cached = _read_last_good_snapshot(
@@ -112,6 +131,35 @@ def _missing_required_columns(df: pd.DataFrame, required_columns: list[str]) -> 
         if df[col].dropna().empty:
             missing.append(col)
     return missing
+
+
+def _source_disabled_reason(source: str) -> str | None:
+    now = time.monotonic()
+    with _SOURCE_HEALTH_LOCK:
+        state = _SOURCE_HEALTH.get(source)
+        if not state:
+            return None
+        disabled_until = float(state.get("disabled_until", 0.0))
+        if disabled_until <= now:
+            if disabled_until:
+                state["disabled_until"] = 0.0
+            return None
+        return f"temporarily disabled for {disabled_until - now:.1f}s after repeated failures"
+
+
+def _record_source_success(source: str) -> None:
+    with _SOURCE_HEALTH_LOCK:
+        _SOURCE_HEALTH.pop(source, None)
+
+
+def _record_source_failure(source: str) -> None:
+    now = time.monotonic()
+    with _SOURCE_HEALTH_LOCK:
+        state = _SOURCE_HEALTH.setdefault(source, {"failures": 0.0, "disabled_until": 0.0})
+        failures = float(state.get("failures", 0.0)) + 1.0
+        state["failures"] = failures
+        if failures >= _SOURCE_HEALTH_FAILURE_THRESHOLD:
+            state["disabled_until"] = now + _SOURCE_HEALTH_COOLDOWN_SECONDS
 
 
 def _write_last_good_snapshot(
@@ -243,13 +291,61 @@ def _fetch_akshare_em() -> pd.DataFrame:
     return _normalize(df, source="akshare_em")
 
 
+def _fetch_sina() -> pd.DataFrame:
+    """Fetch A-share full-market snapshot directly from Sina Finance.
+
+    Sina's market-center endpoint is a lightweight direct HTTP source with PE,
+    PB, turnover and market-cap fields. It gives AlphaSift another non-wrapper,
+    non-Eastmoney-first snapshot option before falling back to Eastmoney-heavy
+    sources.
+    """
+    url = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData"
+    page = 1
+    page_size = 80
+    all_items = []
+    while True:
+        resp = requests.get(
+            url,
+            params={
+                "page": page,
+                "num": page_size,
+                "sort": "symbol",
+                "asc": 1,
+                "node": "hs_a",
+                "symbol": "",
+                "_s_r_a": "page",
+            },
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://vip.stock.finance.sina.com.cn/mkt/",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        items = resp.json()
+        if not isinstance(items, list):
+            raise RuntimeError("sina snapshot returned malformed data")
+        if not items:
+            break
+        all_items.extend(items)
+        if len(items) < page_size:
+            break
+        page += 1
+    if not all_items:
+        raise RuntimeError("sina returned empty data")
+    df = pd.DataFrame(all_items)
+    for col in ("mktcap", "nmc"):
+        if col in df.columns:
+            # Sina exposes market caps in ten-thousand yuan; normalize to yuan.
+            df[col] = pd.to_numeric(df[col], errors="coerce") * 10000
+    return _normalize(df, source="sina")
+
+
 def _fetch_em_datacenter() -> pd.DataFrame:
     """Fetch via eastmoney datacenter xuangu API.
 
     This works even on weekends (returns last trading day data).
     """
-    import requests
-
     url = "https://data.eastmoney.com/dataapi/xuangu/list"
     all_items = []
     page = 1
@@ -273,8 +369,7 @@ def _fetch_em_datacenter() -> pd.DataFrame:
             "Referer": "https://data.eastmoney.com/xuangu/",
         }
 
-        resp = requests.get(url, params=params, headers=headers, timeout=30)
-        resp.raise_for_status()
+        resp = _eastmoney_get(url, params=params, headers=headers, timeout=30)
         data = resp.json()
 
         if not data.get("success"):
@@ -293,6 +388,27 @@ def _fetch_em_datacenter() -> pd.DataFrame:
 
     df = pd.DataFrame(all_items)
     return _normalize(df, source="em_datacenter")
+
+
+def _eastmoney_get(url: str, **kwargs) -> requests.Response:
+    """GET EastMoney endpoints through one throttled shared session.
+
+    EastMoney endpoints are useful but more sensitive to bursty access than
+    lightweight direct sources. Keeping all direct calls behind one session and
+    a small process-wide interval reduces connection churn and accidental
+    request bursts when snapshot fallbacks are exercised repeatedly.
+    """
+    global _EM_LAST_REQUEST_AT, _EM_SESSION
+    with _EM_LOCK:
+        if _EM_SESSION is None:
+            _EM_SESSION = requests.Session()
+        elapsed = time.monotonic() - _EM_LAST_REQUEST_AT
+        if elapsed < _EM_REQUEST_MIN_INTERVAL_SECONDS:
+            time.sleep(_EM_REQUEST_MIN_INTERVAL_SECONDS - elapsed)
+        response = _EM_SESSION.get(url, **kwargs)
+        _EM_LAST_REQUEST_AT = time.monotonic()
+    response.raise_for_status()
+    return response
 
 
 def _fetch_tushare() -> pd.DataFrame:
@@ -438,6 +554,19 @@ def _normalize(df: pd.DataFrame, source: str) -> pd.DataFrame:
             "turnover_rate": ["换手率"],
             "industry": ["行业", "所属行业", "行业板块"],
             "concepts": ["概念", "概念题材", "题材"],
+        }
+    elif source == "sina":
+        standard_cols = {
+            "code": ["code"],
+            "name": ["name"],
+            "price": ["trade"],
+            "change_pct": ["changepercent"],
+            "amount": ["amount"],
+            "total_mv": ["mktcap"],
+            "circ_mv": ["nmc"],
+            "pe_ratio": ["per"],
+            "pb_ratio": ["pb"],
+            "turnover_rate": ["turnoverratio"],
         }
     elif source == "em_datacenter":
         standard_cols = {

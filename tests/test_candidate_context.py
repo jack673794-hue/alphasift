@@ -8,6 +8,7 @@ from alphasift.candidate_context import (
     classify_announcement_categories,
     classify_negative_events,
     collect_candidate_context,
+    fetch_stock_quote_summary,
 )
 
 
@@ -43,6 +44,59 @@ def test_collect_candidate_context_uses_requested_providers(monkeypatch):
     assert "新闻:" in rows[0]["context_summary"]
     assert isinstance(rows[0]["event_tags"], list)
     assert isinstance(rows[0]["negative_event_flags"], list)
+
+
+def test_fetch_stock_quote_summary_parses_tencent_quote(monkeypatch):
+    captured = {}
+    parts = [""] * 50
+    parts[1] = "平安银行"
+    parts[3] = "11.24"
+    parts[32] = "2.74"
+    parts[33] = "11.25"
+    parts[34] = "10.88"
+    parts[37] = "226304"
+    parts[38] = "1.05"
+    parts[39] = "5.07"
+    parts[44] = "2181.19"
+    parts[45] = "2181.23"
+
+    class FakeResponse:
+        text = 'v_sz000001="' + "~".join(parts) + '";'
+
+        def raise_for_status(self):
+            return None
+
+    def fake_get(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return FakeResponse()
+
+    monkeypatch.setattr("alphasift.candidate_context.requests.get", fake_get)
+
+    summary = fetch_stock_quote_summary("1")
+
+    assert captured["url"] == "https://qt.gtimg.cn/q=sz000001"
+    assert captured["headers"]["User-Agent"] == "Mozilla/5.0"
+    assert "现价=11.24" in summary
+    assert "换手率=1.05" in summary
+    assert "市盈率=5.07" in summary
+
+
+def test_collect_candidate_context_supports_quote_provider(monkeypatch):
+    monkeypatch.setattr(
+        candidate_context,
+        "fetch_stock_quote_summary",
+        lambda code: "现价=11.24，市盈率=5.07，换手率=1.05",
+    )
+    candidates = pd.DataFrame([{"code": "000001", "name": "平安银行"}])
+
+    rows, errors = collect_candidate_context(candidates, providers=["quote"])
+
+    assert errors == []
+    assert rows[0]["quote"] == "现价=11.24，市盈率=5.07，换手率=1.05"
+    assert rows[0]["source_count"] == 1
+    assert rows[0]["source_confidence"] == 1.0
+    assert "行情估值:现价=11.24" in str(rows[0]["context_summary"])
 
 
 def test_collect_candidate_context_concurrent_fetch_preserves_candidate_order(monkeypatch):
