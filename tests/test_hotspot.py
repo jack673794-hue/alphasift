@@ -5,8 +5,10 @@ import pandas as pd
 from alphasift.hotspot import (
     HotspotStock,
     HotspotSummary,
+    TimelineEvent,
     append_hotspot_history,
     assign_stock_roles,
+    build_hotspot_route,
     classify_hotspot_stage,
     compute_hotspot_heat_score,
     discover_hotspots,
@@ -362,6 +364,29 @@ def test_get_hotspot_detail_uses_canonical_topic_for_provider_lookup():
     assert [stock.name for stock in detail.stocks] == ["算力龙头"]
 
 
+def test_get_hotspot_detail_builds_display_route_from_timeline(tmp_path):
+    timeline = tmp_path / "timeline.jsonl"
+    timeline.write_text(
+        '{"date":"2026-06-05T10:30:00","topic":"AI绠楀姏","source":"notice","title":"Order catalyst","description":"GPU cluster order landed and expanded demand visibility.","event_type":"order","impact_score":8,"related_codes":["SZ300001"],"url":"https://example.test/order"}\n'
+        '{"date":"2026-06-04","topic":"AI绠楀姏","source":"news","title":"Early spread","impact_score":6,"related_codes":"300002"}\n',
+        encoding="utf-8",
+    )
+
+    detail = get_hotspot_detail(
+        "AI绠楀姏",
+        provider=FakeHotspotProvider(),
+        top_stocks=2,
+        timeline_path=timeline,
+    )
+
+    assert [event.description for event in detail.timeline] == ["", "GPU cluster order landed and expanded demand visibility."]
+    assert detail.timeline[1].url == "https://example.test/order"
+    assert [item.date for item in detail.route] == ["2026-06-05", "2026-06-04"]
+    assert detail.route[0].title == "Order catalyst"
+    assert detail.route[0].description == "GPU cluster order landed and expanded demand visibility."
+    assert detail.route[0].related_codes == ["300001"]
+
+
 def test_get_hotspot_detail_falls_back_to_cache_and_keeps_valid_timeline(tmp_path):
     cache = tmp_path / "hotspots.json"
     timeline = tmp_path / "timeline.jsonl"
@@ -431,6 +456,9 @@ def test_get_hotspot_detail_uses_structured_leader_stock_fallback(tmp_path):
     assert detail.stocks[0].code == "300001"
     assert detail.stocks[0].source == "last_good_cache.leader_stocks"
     assert detail.stocks[0].source_confidence == 0.65
+    assert detail.route[0].title == "Current fermentation"
+    assert "heat 82.0" in detail.route[0].description
+    assert detail.route[0].related_codes == ["300001"]
 
 
 def test_get_hotspot_detail_records_timeline_failure_without_losing_cache(tmp_path):
@@ -450,6 +478,46 @@ def test_get_hotspot_detail_records_timeline_failure_without_losing_cache(tmp_pa
     assert detail.stocks[0].name == "算力龙头"
     assert "timeline" in detail.summary.missing_fields
     assert any("timeline:" in error for error in detail.summary.source_errors)
+
+
+def test_build_hotspot_route_groups_by_day_and_compacts_long_text():
+    long_description = " ".join(["demand"] * 80)
+
+    route = build_hotspot_route(
+        HotspotSummary(topic="AI绠楀姏", heat_score=88),
+        [
+            TimelineEvent(
+                date="2026-06-05T10:30:00",
+                source="news",
+                title="first catalyst",
+                description=long_description,
+                impact_score=5,
+                related_codes=["300001"],
+            ),
+            TimelineEvent(
+                date="2026-06-05T14:00:00",
+                source="notice",
+                title="second catalyst",
+                description="contract disclosed",
+                event_type="announcement",
+                impact_score=9,
+                related_codes=["300002"],
+            ),
+            TimelineEvent(
+                date="2026-06-04",
+                source="news",
+                title="early spread",
+                impact_score=3,
+            ),
+        ],
+        max_description_chars=60,
+    )
+
+    assert [item.date for item in route] == ["2026-06-05", "2026-06-04"]
+    assert route[0].title == "second catalyst"
+    assert route[0].impact_score == 9
+    assert route[0].related_codes == ["300002", "300001"]
+    assert len(route[0].description) <= 60
 
 
 def test_history_append_loads_trend_compatible_jsonl(tmp_path):

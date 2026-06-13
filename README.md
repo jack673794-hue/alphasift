@@ -108,7 +108,7 @@ Full market 5190 stocks -> 126 after hard filters -> Top 5 output.
 
 ## Hotspot workflow
 
-AlphaSift can discover current market hotspots and resolve a specific topic into a detail payload with timeline, leader stocks, source confidence, stale/fallback metadata, and quality diagnostics.
+AlphaSift can discover current market hotspots and resolve a specific topic into a detail payload with raw timeline evidence, compact display-ready route events, leader stocks, source confidence, stale/fallback metadata, and quality diagnostics.
 
 ```bash
 # Discover hotspot topics and write schema_version=2 cache/history sidecars
@@ -130,6 +130,8 @@ Hotspot cache files include:
 - sidecars such as `*.meta.json` and JSONL history when requested
 
 Leader stock fallbacks are intentionally explicit. When live constituent APIs fail and AlphaSift uses last-good/cache leaders, returned stocks carry fields such as `source="last_good_cache.leader_stocks"`, `source_confidence`, and `fallback_used=true` instead of pretending to be live provider data.
+
+Hotspot details keep the raw `timeline` for auditability and also expose a compact `route` list for applications. `route` is grouped by day, newest first, trimmed for UI display, and falls back to a short current heat/stage/leader summary when no timeline evidence is available.
 
 ## Python API
 

@@ -707,6 +707,13 @@ def _format_hotspot_detail_explain(detail) -> str:
                 f"{event.date:<12} {event.source:<8} {event.event_type:<10} "
                 f"{event.impact_score:<6.1f} {event.title[:40]} {codes}"
             )
+    if getattr(detail, "route", None):
+        lines.append("route date source type impact title description")
+        for item in detail.route:
+            lines.append(
+                f"{item.date:<12} {item.source:<8} {item.event_type:<10} "
+                f"{item.impact_score:<6.1f} {item.title[:32]} {item.description[:80]}"
+            )
     return "\n".join(lines)
 
 

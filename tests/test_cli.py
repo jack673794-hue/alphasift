@@ -4,6 +4,7 @@ import sys
 from alphasift.cli import _append_industry_cache_history, _write_industry_cache_metadata, main
 from alphasift.hotspot import (
     HotspotDetail,
+    HotspotRouteItem,
     HotspotStock,
     HotspotSummary,
     TimelineEvent,
@@ -131,6 +132,16 @@ def test_cli_hotspot_explain_formats_detail(monkeypatch, capsys):
                     related_codes=["300001"],
                 )
             ],
+            route=[
+                HotspotRouteItem(
+                    date="2026-06-05",
+                    source="notice",
+                    title="Order catalyst",
+                    description="short catalyst summary",
+                    event_type="order",
+                    impact_score=8,
+                )
+            ],
         )
 
     monkeypatch.setattr("alphasift.cli.get_hotspot_detail", fake_detail)
@@ -146,6 +157,8 @@ def test_cli_hotspot_explain_formats_detail(monkeypatch, capsys):
     assert "topic=AI算力" in out
     assert "核心龙头" in out
     assert "订单落地" in out
+    assert "Order catalyst" in out
+    assert "short catalyst summary" in out
     assert "fallback=True" in out
     assert "source_errors=akshare: disconnected" in out
 

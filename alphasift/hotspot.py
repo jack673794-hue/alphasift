@@ -97,6 +97,22 @@ class TimelineEvent:
     event_type: str = "news"
     impact_score: float = 0.0
     related_codes: list[str] = field(default_factory=list)
+    description: str = ""
+    url: str = ""
+    published_at: str = ""
+
+
+@dataclass
+class HotspotRouteItem:
+    date: str
+    title: str
+    description: str = ""
+    source: str = ""
+    event_type: str = "summary"
+    impact_score: float = 0.0
+    related_codes: list[str] = field(default_factory=list)
+    url: str = ""
+    published_at: str = ""
 
 
 @dataclass
@@ -104,6 +120,7 @@ class HotspotDetail:
     summary: HotspotSummary
     stocks: list[HotspotStock] = field(default_factory=list)
     timeline: list[TimelineEvent] = field(default_factory=list)
+    route: list[HotspotRouteItem] = field(default_factory=list)
 
 
 class HotspotResults(list[HotspotSummary]):
@@ -570,7 +587,28 @@ def get_hotspot_detail(
             summary.source_errors = _dedupe_errors([*summary.source_errors, f"timeline: {exc}"])
             _add_missing_fields(summary, ["timeline"])
             _finalize_summary_quality(summary, stock_count=len(stocks))
-    return HotspotDetail(summary=summary, stocks=stocks[:max(int(top_stocks), 0)], timeline=timeline)
+    capped_stocks = stocks[:max(int(top_stocks), 0)]
+    route = build_hotspot_route(summary, timeline, capped_stocks)
+    return HotspotDetail(summary=summary, stocks=capped_stocks, timeline=timeline, route=route)
+
+
+def build_hotspot_route(
+    summary: HotspotSummary,
+    timeline: list[TimelineEvent] | None = None,
+    stocks: list[HotspotStock] | None = None,
+    *,
+    max_items: int = 5,
+    max_description_chars: int = 180,
+) -> list[HotspotRouteItem]:
+    """Build compact, display-ready route events without dropping raw timeline data."""
+    events = timeline or []
+    if events:
+        return _build_route_from_timeline(
+            events,
+            max_items=max_items,
+            max_description_chars=max_description_chars,
+        )
+    return [_build_summary_route_item(summary, stocks or [], max_description_chars=max_description_chars)]
 
 
 def load_hotspot_history(path_like: str | Path) -> list[dict[str, Any]]:
@@ -666,6 +704,9 @@ def load_hotspot_timeline(path_like: str | Path, topic: str | None = None) -> li
             event_type=_safe_text(item.get("event_type")) or "news",
             impact_score=round(_safe_float(item.get("impact_score")) or 0.0, 4),
             related_codes=_normalize_related_codes(item.get("related_codes")),
+            description=_safe_text(item.get("description") or item.get("summary") or item.get("content")),
+            url=_safe_text(item.get("url") or item.get("link")),
+            published_at=_safe_text(item.get("published_at") or item.get("publish_time") or item.get("time")),
         ))
     return sorted(events, key=lambda item: (item.date, item.source, item.title))
 
@@ -738,6 +779,7 @@ def hotspot_detail_to_dict(detail: HotspotDetail) -> dict[str, Any]:
         "summary": asdict(detail.summary),
         "stocks": [asdict(item) for item in detail.stocks],
         "timeline": [asdict(item) for item in detail.timeline],
+        "route": [asdict(item) for item in detail.route],
     }
 
 
@@ -1311,6 +1353,95 @@ def _dedupe_timeline(events: list[TimelineEvent]) -> list[TimelineEvent]:
     for event in events:
         deduped[(event.date, event.source, event.title)] = event
     return sorted(deduped.values(), key=lambda item: (item.date, item.source, item.title))
+
+
+def _build_route_from_timeline(
+    events: list[TimelineEvent],
+    *,
+    max_items: int,
+    max_description_chars: int,
+) -> list[HotspotRouteItem]:
+    grouped: dict[str, list[TimelineEvent]] = {}
+    for event in events:
+        date = _event_day(event.date or event.published_at)
+        grouped.setdefault(date, []).append(event)
+
+    route: list[HotspotRouteItem] = []
+    for date in sorted(grouped.keys(), reverse=True)[:max(int(max_items), 1)]:
+        day_events = sorted(
+            grouped[date],
+            key=lambda item: (item.impact_score, item.published_at, item.source, item.title),
+            reverse=True,
+        )
+        lead = day_events[0]
+        texts = []
+        for event in day_events[:3]:
+            text = _safe_text(event.description) or _safe_text(event.title)
+            if text:
+                texts.append(text)
+        description = _compact_text(" ".join(_dedupe_texts(texts)), max_description_chars)
+        route.append(HotspotRouteItem(
+            date=date,
+            title=_route_title(lead),
+            description=description,
+            source=lead.source,
+            event_type=lead.event_type,
+            impact_score=round(max(event.impact_score for event in day_events), 4),
+            related_codes=_dedupe_texts([
+                code
+                for event in day_events
+                for code in event.related_codes
+            ]),
+            url=lead.url,
+            published_at=lead.published_at,
+        ))
+    return route
+
+
+def _build_summary_route_item(
+    summary: HotspotSummary,
+    stocks: list[HotspotStock],
+    *,
+    max_description_chars: int,
+) -> HotspotRouteItem:
+    leaders = summary.leaders or [stock.name for stock in stocks[:3] if stock.name]
+    parts = [
+        f"{summary.topic or summary.name} heat {summary.heat_score:.1f}",
+        f"stage {summary.stage}" if summary.stage else "",
+        "leaders " + ", ".join(leaders[:3]) if leaders else "",
+    ]
+    source = summary.provider_used or summary.source or "alphasift_hotspot"
+    return HotspotRouteItem(
+        date=_event_day(datetime.now(timezone.utc).isoformat()),
+        title="Current fermentation",
+        description=_compact_text("; ".join(_dedupe_texts(parts)), max_description_chars),
+        source=source,
+        event_type="summary",
+        impact_score=round(_safe_float(summary.heat_score) or 0.0, 4),
+        related_codes=[stock.code for stock in stocks[:3] if stock.code],
+    )
+
+
+def _route_title(event: TimelineEvent) -> str:
+    event_type = _safe_text(event.event_type).lower()
+    if event_type in {"announcement", "notice", "order", "policy", "fund_flow"}:
+        return event.title[:60]
+    return "News catalyst"
+
+
+def _event_day(value: str) -> str:
+    text = _safe_text(value)
+    if len(text) >= 10:
+        return text[:10]
+    return text
+
+
+def _compact_text(value: str, max_chars: int) -> str:
+    text = " ".join(_safe_text(value).split())
+    limit = max(int(max_chars), 20)
+    if len(text) <= limit:
+        return text
+    return text[: max(limit - 3, 0)].rstrip() + "..."
 
 
 def _dedupe_texts(values: list[object]) -> list[str]:
