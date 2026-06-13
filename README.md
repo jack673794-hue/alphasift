@@ -230,7 +230,7 @@ tushare -> sina -> efinance -> akshare_em -> em_datacenter
 
 Daily K-line enrichment defaults to `DAILY_SOURCE=auto`. The auto chain uses `tushare -> tencent -> akshare -> baostock` when a Tushare token is configured, otherwise `tencent -> akshare -> baostock`. Tencent is a direct HTTP K-line source with no wrapper dependency and is preferred over Eastmoney-heavy wrapper paths for candidate-level history enrichment.
 
-If a source is unavailable or lacks fields required by a strategy, AlphaSift skips it and tries the next source. If all live sources fail, the last-good snapshot fallback is explicitly marked as stale/fallback data; `SNAPSHOT_FALLBACK_MAX_AGE_HOURS` can reject overly old fallback cache to avoid repeating stale selections.
+If a source is unavailable or lacks fields required by a strategy, AlphaSift skips it and tries the next source. Eastmoney-only HTTP fallbacks use a shared throttled session to reduce connection churn and bursty access. If all live sources fail, the last-good snapshot fallback is explicitly marked as stale/fallback data; `SNAPSHOT_FALLBACK_MAX_AGE_HOURS` can reject overly old fallback cache to avoid repeating stale selections.
 
 ## Built-in strategies
 

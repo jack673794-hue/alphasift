@@ -6,6 +6,7 @@ import pytest
 
 from alphasift.snapshot import (
     _configure_tushare_client,
+    _eastmoney_get,
     _fetch_sina,
     _normalize,
     _prepare_tushare_snapshot,
@@ -114,6 +115,33 @@ def test_fetch_sina_paginates_and_normalizes_market_cap_units(monkeypatch):
     assert calls[0]["headers"]["Referer"] == "https://vip.stock.finance.sina.com.cn/mkt/"
     assert normalized.loc[0, "total_mv"] == pytest.approx(1000000000)
     assert normalized.loc[0, "circ_mv"] == pytest.approx(800000000)
+
+
+def test_eastmoney_get_reuses_session_and_throttles(monkeypatch):
+    events = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            events.append("raise")
+
+    class FakeSession:
+        def get(self, url, **kwargs):
+            events.append((url, kwargs))
+            return FakeResponse()
+
+    times = iter([100.0, 100.1, 100.4])
+    monkeypatch.setattr("alphasift.snapshot._EM_SESSION", FakeSession())
+    monkeypatch.setattr("alphasift.snapshot._EM_LAST_REQUEST_AT", 99.95)
+    monkeypatch.setattr("alphasift.snapshot.time.monotonic", lambda: next(times))
+    monkeypatch.setattr("alphasift.snapshot.time.sleep", lambda seconds: events.append(("sleep", seconds)))
+
+    response = _eastmoney_get("https://example.test", params={"p": 1})
+
+    assert isinstance(response, FakeResponse)
+    assert events[0][0] == "sleep"
+    assert events[0][1] == pytest.approx(0.2)
+    assert events[1] == ("https://example.test", {"params": {"p": 1}})
+    assert events[2] == "raise"
 
 
 def test_prepare_tushare_snapshot_maps_fields_and_units():

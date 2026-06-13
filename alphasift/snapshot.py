@@ -8,6 +8,7 @@ This is separate from single-stock realtime quotes.
 import logging
 import json
 import os
+import threading
 import time
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
@@ -19,6 +20,10 @@ logger = logging.getLogger(__name__)
 
 _SNAPSHOT_CACHE_VERSION = 1
 _DEFAULT_TUSHARE_HTTP_URL = "http://api.waditu.com"
+_EM_REQUEST_MIN_INTERVAL_SECONDS = 0.25
+_EM_SESSION: requests.Session | None = None
+_EM_LAST_REQUEST_AT = 0.0
+_EM_LOCK = threading.Lock()
 
 
 def fetch_cn_snapshot(source: str = "efinance") -> pd.DataFrame:
@@ -324,8 +329,7 @@ def _fetch_em_datacenter() -> pd.DataFrame:
             "Referer": "https://data.eastmoney.com/xuangu/",
         }
 
-        resp = requests.get(url, params=params, headers=headers, timeout=30)
-        resp.raise_for_status()
+        resp = _eastmoney_get(url, params=params, headers=headers, timeout=30)
         data = resp.json()
 
         if not data.get("success"):
@@ -344,6 +348,27 @@ def _fetch_em_datacenter() -> pd.DataFrame:
 
     df = pd.DataFrame(all_items)
     return _normalize(df, source="em_datacenter")
+
+
+def _eastmoney_get(url: str, **kwargs) -> requests.Response:
+    """GET EastMoney endpoints through one throttled shared session.
+
+    EastMoney endpoints are useful but more sensitive to bursty access than
+    lightweight direct sources. Keeping all direct calls behind one session and
+    a small process-wide interval reduces connection churn and accidental
+    request bursts when snapshot fallbacks are exercised repeatedly.
+    """
+    global _EM_LAST_REQUEST_AT, _EM_SESSION
+    with _EM_LOCK:
+        if _EM_SESSION is None:
+            _EM_SESSION = requests.Session()
+        elapsed = time.monotonic() - _EM_LAST_REQUEST_AT
+        if elapsed < _EM_REQUEST_MIN_INTERVAL_SECONDS:
+            time.sleep(_EM_REQUEST_MIN_INTERVAL_SECONDS - elapsed)
+        response = _EM_SESSION.get(url, **kwargs)
+        _EM_LAST_REQUEST_AT = time.monotonic()
+    response.raise_for_status()
+    return response
 
 
 def _fetch_tushare() -> pd.DataFrame:
