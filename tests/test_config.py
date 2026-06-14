@@ -10,6 +10,7 @@ def test_config_reads_daily_stock_analysis_litellm_env(monkeypatch):
     monkeypatch.setenv("OPENAI_BASE_URL", "https://api.siliconflow.cn/v1")
     monkeypatch.setenv("LITELLM_FALLBACK_MODELS", "openai/gpt-4o-mini,anthropic/claude-3-5-sonnet")
     monkeypatch.setenv("LLM_TIMEOUT_SEC", "42")
+    monkeypatch.setenv("LLM_MAX_TOKENS", "1234")
 
     config = Config.from_env()
 
@@ -18,6 +19,7 @@ def test_config_reads_daily_stock_analysis_litellm_env(monkeypatch):
     assert config.llm_base_url == "https://api.siliconflow.cn/v1"
     assert config.llm_fallback_models == ["openai/gpt-4o-mini", "anthropic/claude-3-5-sonnet"]
     assert config.llm_timeout_sec == 42
+    assert config.llm_max_tokens == 1234
     assert config.has_llm_config() is True
 
 

@@ -340,6 +340,7 @@ def screen(
             channels=config.llm_channels,
             config_path=str(config.llm_config_path or ""),
             timeout_sec=config.llm_timeout_sec,
+            max_tokens=config.llm_max_tokens,
             degradation=llm_prompt_degradation,
         )
         degradation.extend(llm_prompt_degradation)
