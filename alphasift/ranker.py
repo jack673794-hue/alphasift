@@ -69,6 +69,7 @@ def rank_candidates(
     config_path: str = "",
     timeout_sec: float = 60.0,
     max_prompt_chars: int | None = _DEFAULT_RANKING_PROMPT_MAX_CHARS,
+    max_tokens: int | None = 2048,
 ) -> list[Pick]:
     """Use LLM to re-rank candidates and add ranking_reason / risk_summary.
 
@@ -92,6 +93,7 @@ def rank_candidates(
         config_path=config_path,
         timeout_sec=timeout_sec,
         max_prompt_chars=max_prompt_chars,
+        max_tokens=max_tokens,
     ).picks
 
 
@@ -115,6 +117,7 @@ def rank_candidates_with_metadata(
     timeout_sec: float = 60.0,
     max_prompt_chars: int | None = _DEFAULT_RANKING_PROMPT_MAX_CHARS,
     degradation: list[str] | None = None,
+    max_tokens: int | None = 2048,
 ) -> LLMRankingResult:
     """Use LLM to re-rank candidates and return global research metadata."""
     if not candidates:
@@ -150,6 +153,7 @@ def rank_candidates_with_metadata(
                 channels=channels or [],
                 config_path=config_path,
                 timeout_sec=timeout_sec,
+                max_tokens=max_tokens,
             )
             parsed = _parse_ranking_response_detail(response, candidates)
             last_errors = parsed.errors
@@ -479,6 +483,7 @@ def _call_llm(
     channels: list[dict[str, object]] | None = None,
     config_path: str = "",
     timeout_sec: float = 60.0,
+    max_tokens: int | None = 2048,
 ) -> str:
     """Call LLM via litellm with fallback models and channel configs."""
     import litellm
@@ -499,6 +504,7 @@ def _call_llm(
             temperature=temperature,
             json_mode=json_mode,
             timeout_sec=timeout_sec,
+            max_tokens=max_tokens,
         )
         if router_result is not None:
             return router_result
@@ -513,6 +519,9 @@ def _call_llm(
             kwargs["messages"] = messages
             kwargs["temperature"] = temperature
             kwargs["timeout"] = timeout_sec
+            kwargs["num_retries"] = 0
+            if max_tokens is not None and int(max_tokens) > 0:
+                kwargs["max_tokens"] = int(max_tokens)
             if json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
             try:
@@ -520,9 +529,15 @@ def _call_llm(
                 return response.choices[0].message.content or ""
             except Exception as exc:
                 last_error = exc
-                if json_mode and "response_format" in kwargs:
+                if _is_timeout_error(exc):
+                    raise
+                if json_mode and "response_format" in kwargs and _is_json_mode_unsupported(exc):
                     # Some providers do not support JSON mode. Retry the same
-                    # request without it before moving to fallback models.
+                    # request without it before moving to fallback models. Do
+                    # not do this for timeout/connection failures: a local
+                    # OpenAI-compatible server may keep generating after the
+                    # client timeout, so a blind retry can duplicate expensive
+                    # work while the first request is still running.
                     retry_kwargs = dict(kwargs)
                     retry_kwargs.pop("response_format", None)
                     try:
@@ -536,6 +551,26 @@ def _call_llm(
     if last_error is not None:
         raise last_error
     raise RuntimeError("No LLM model configured")
+
+
+def _is_json_mode_unsupported(exc: Exception) -> bool:
+    """Return True only for provider errors that clearly reject JSON mode."""
+    if _is_timeout_error(exc):
+        return False
+    text = str(exc).lower()
+    return (
+        "response_format" in text
+        or "json mode" in text
+        or "json_object" in text
+        or ("not support" in text and "json" in text)
+        or ("unsupported" in text and "json" in text)
+    )
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    timeout_markers = ("timeout", "timed out", "readtimeout", "apitimeout")
+    return any(marker in text for marker in timeout_markers)
 
 
 def _parse_ranking_response(response: str, candidates: list[Pick]) -> list[Pick]:
@@ -691,6 +726,7 @@ def _call_litellm_router(
     temperature: float,
     json_mode: bool,
     timeout_sec: float,
+    max_tokens: int | None = 2048,
 ) -> str | None:
     try:
         import yaml
@@ -702,19 +738,29 @@ def _call_litellm_router(
             return None
         router = litellm.Router(model_list=model_list)
         for model in model_chain:
-            kwargs = {"model": model, "messages": messages, "temperature": temperature, "timeout": timeout_sec}
+            kwargs = {
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "timeout": timeout_sec,
+                "num_retries": 0,
+            }
+            if max_tokens is not None and int(max_tokens) > 0:
+                kwargs["max_tokens"] = int(max_tokens)
             if json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
             try:
                 response = router.completion(**kwargs)
                 return response.choices[0].message.content or ""
-            except Exception:
-                if "response_format" in kwargs:
+            except Exception as exc:
+                if "response_format" in kwargs and _is_json_mode_unsupported(exc):
                     kwargs.pop("response_format", None)
                     response = router.completion(**kwargs)
                     return response.choices[0].message.content or ""
                 raise
     except Exception as exc:
+        if _is_timeout_error(exc):
+            raise
         logger.warning("LiteLLM router config failed, falling back to direct calls: %s", exc)
     return None
 

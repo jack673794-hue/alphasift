@@ -1,9 +1,12 @@
 import json
+import sys
+import types
 
 from alphasift.models import Pick
 from alphasift.ranker import (
     _build_litellm_attempts,
     _build_ranking_prompt,
+    _call_llm,
     _parse_ranking_response,
     _parse_ranking_response_detail,
     rank_candidates,
@@ -136,6 +139,69 @@ def test_rank_candidates_blends_screen_and_llm_scores(monkeypatch):
     assert [p.code for p in ranked] == ["600000", "000001"]
     assert ranked[0].final_score == 80.0
     assert ranked[1].final_score == 72.0
+
+
+def test_call_llm_sets_generation_bounds_and_disables_sdk_retries(monkeypatch):
+    captured = {}
+
+    class FakeMessage:
+        content = '{"ranked": []}'
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+
+    fake_litellm = types.ModuleType("litellm")
+
+    def fake_completion(**kwargs):
+        captured.update(kwargs)
+        return FakeResponse()
+
+    setattr(fake_litellm, "completion", fake_completion)
+    monkeypatch.setitem(sys.modules, "litellm", fake_litellm)
+
+    response = _call_llm(
+        "prompt",
+        api_key="key",
+        model="openai/local-model",
+        base_url="http://localhost:8000/v1",
+        timeout_sec=7,
+        max_tokens=321,
+    )
+
+    assert response == '{"ranked": []}'
+    assert captured["timeout"] == 7
+    assert captured["max_tokens"] == 321
+    assert captured["num_retries"] == 0
+
+
+def test_call_llm_does_not_retry_without_json_mode_on_timeout(monkeypatch):
+    calls = []
+    fake_litellm = types.ModuleType("litellm")
+
+    def fake_completion(**kwargs):
+        calls.append(kwargs)
+        raise TimeoutError("APITimeoutError - Request timed out")
+
+    setattr(fake_litellm, "completion", fake_completion)
+    monkeypatch.setitem(sys.modules, "litellm", fake_litellm)
+
+    try:
+        _call_llm(
+            "prompt",
+            api_key="key",
+            model="openai/local-model",
+            base_url="http://localhost:8000/v1",
+            json_mode=True,
+            fallback_models=["openai/backup-model"],
+        )
+    except TimeoutError:
+        pass
+
+    assert len(calls) == 1
+    assert calls[0]["response_format"] == {"type": "json_object"}
 
 
 def test_build_litellm_attempts_uses_matching_channel_keys():
