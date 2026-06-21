@@ -109,7 +109,10 @@ def enrich_daily_features(
             }
             return idx, features, None, metadata
         except Exception as exc:
-            return idx, dict(_DAILY_FEATURE_DEFAULTS), f"{code}: {exc}", {}
+            features = dict(_DAILY_FEATURE_DEFAULTS)
+            features["daily_quality_score"] = 0.0
+            features["daily_quality_flags"] = "fetch_failed"
+            return idx, features, f"{code}: {exc}", {"daily_quality_flags": "fetch_failed"}
 
     if len(fetch_requests) <= 1:
         fetched_rows = [fetch_one(request) for request in fetch_requests]
@@ -119,15 +122,15 @@ def enrich_daily_features(
             fetched_rows = list(executor.map(fetch_one, fetch_requests))
 
     for idx, features, error, metadata in fetched_rows:
+        for flag in str(metadata.get("daily_quality_flags") or "").split(";"):
+            if flag:
+                daily_quality_flag_counts[flag] = daily_quality_flag_counts.get(flag, 0) + 1
         if error:
             daily_errors.append(error)
         else:
             success_count += 1
             source_name = str(metadata.get("daily_source") or "unknown")
             daily_source_counts[source_name] = daily_source_counts.get(source_name, 0) + 1
-            for flag in str(metadata.get("daily_quality_flags") or "").split(";"):
-                if flag:
-                    daily_quality_flag_counts[flag] = daily_quality_flag_counts.get(flag, 0) + 1
             order_notes = metadata.get("daily_source_order_notes", [])
             if not isinstance(order_notes, list):
                 order_notes = []

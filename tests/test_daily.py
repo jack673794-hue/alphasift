@@ -612,10 +612,12 @@ def test_enrich_daily_features_keeps_successful_rows_when_one_fetch_fails(monkey
     assert result.loc[0, "daily_quality_score"] == 88.0
     assert result.loc[0, "daily_quality_flags"] == "missing_volume"
     assert result.attrs["daily_source_counts"] == {"akshare": 1}
-    assert result.attrs["daily_quality_flag_counts"] == {"missing_volume": 1}
+    assert result.attrs["daily_quality_flag_counts"] == {"missing_volume": 1, "fetch_failed": 1}
     assert result.attrs["daily_source_order_notes"] == ["daily source order adjusted by health: akshare"]
     assert result.attrs["daily_source_health"] == {"akshare": {"successes": 1.0}}
     assert pd.isna(result.loc[1, "daily_data_points"])
+    assert result.loc[1, "daily_quality_score"] == 0.0
+    assert result.loc[1, "daily_quality_flags"] == "fetch_failed"
 
 
 def test_enrich_daily_features_fetches_rows_concurrently_preserving_index(monkeypatch):
