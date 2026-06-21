@@ -148,7 +148,7 @@ tushare -> sina -> efinance -> akshare_em -> em_datacenter
 
 | 能力 | 默认链路 | 主要字段 |
 |------|----------|----------|
-| 日 K 增强 | 有 token: `tushare,tencent,sina,akshare,baostock`；无 token: `tencent,sina,akshare,baostock` | OHLCV、前复权（支持源）、技术指标、20日波动/ATR/回撤、逐行 `daily_source` 来源标记 |
+| 日 K 增强 | 有 token: `tushare,tencent,sina,akshare,baostock`；无 token: `tencent,sina,akshare,baostock` | OHLCV、前复权（支持源）、技术指标、20日波动/ATR/回撤、逐行 `daily_source` 来源标记、`daily_quality_score`/flags |
 | 全市场快照 | 有 token: `tushare,sina,efinance,akshare_em,em_datacenter`；无 token: `sina,efinance,akshare_em,em_datacenter` | 价格、涨跌幅、成交额、市值、PE/PB、换手率 |
 | 候选级上下文 | `news,fund_flow,announcement,quote` | 新闻、资金流、公告、腾讯行情估值/换手率 |
 | 失败降级 | source health 熔断 + daily history cache + snapshot last-good cache | stale/fallback/source_errors 元数据 |

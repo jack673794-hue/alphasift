@@ -480,6 +480,8 @@ def _df_to_picks(df: pd.DataFrame) -> list[Pick]:
             volatility_20d_pct=_safe_float(row.get("volatility_20d_pct")),
             max_drawdown_20d_pct=_safe_float(row.get("max_drawdown_20d_pct")),
             atr_20_pct=_safe_float(row.get("atr_20_pct")),
+            daily_quality_score=_safe_float(row.get("daily_quality_score")),
+            daily_quality_flags=_safe_text(row.get("daily_quality_flags")),
             daily_source=_safe_text(row.get("daily_source")),
             factor_scores=factor_scores,
         ))

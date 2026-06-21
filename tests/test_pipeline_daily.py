@@ -53,6 +53,8 @@ def test_pipeline_enriches_daily_features_for_daily_strategy(monkeypatch):
             enriched.at[idx, "volatility_20d_pct"] = 25 if is_target else 60
             enriched.at[idx, "max_drawdown_20d_pct"] = -5 if is_target else -18
             enriched.at[idx, "atr_20_pct"] = 3 if is_target else 9
+            enriched.at[idx, "daily_quality_score"] = 100 if is_target else 70
+            enriched.at[idx, "daily_quality_flags"] = "" if is_target else "fallback_errors"
             enriched.at[idx, "daily_source"] = "tencent"
         return enriched
 
@@ -77,6 +79,8 @@ def test_pipeline_enriches_daily_features_for_daily_strategy(monkeypatch):
     assert result.picks[0].volatility_20d_pct == 25
     assert result.picks[0].max_drawdown_20d_pct == -5
     assert result.picks[0].atr_20_pct == 3
+    assert result.picks[0].daily_quality_score == 100
+    assert result.picks[0].daily_quality_flags == ""
     assert result.picks[0].daily_source == "tencent"
     assert any("Daily K-line enrichment attempted 2 candidates" in item for item in result.degradation)
 

@@ -37,6 +37,8 @@ _DAILY_FEATURE_DEFAULTS = {
     "volatility_20d_pct": pd.NA,
     "max_drawdown_20d_pct": pd.NA,
     "atr_20_pct": pd.NA,
+    "daily_quality_score": pd.NA,
+    "daily_quality_flags": "",
     "daily_source": "",
 }
 _DAILY_ENRICH_MAX_WORKERS = 1
@@ -722,6 +724,7 @@ def compute_daily_features(hist: pd.DataFrame) -> dict[str, object]:
     last_ma20 = _last_float(ma20)
     last_ma60 = _last_float(ma60)
     shape = _compute_shape_features(df, last_close=last_close, last_ma20=last_ma20)
+    quality = _compute_daily_quality(hist, df)
 
     lookback_idx = max(0, len(close) - 61)
     base_close = float(close.iloc[lookback_idx])
@@ -754,6 +757,7 @@ def compute_daily_features(hist: pd.DataFrame) -> dict[str, object]:
         "rsi14": None if rsi_value is None else round(float(rsi_value), 4),
         "signal_score": round(float(signal_score), 4),
         **shape,
+        **quality,
     }
 
 
@@ -782,6 +786,53 @@ def _normalize_daily_history(hist: pd.DataFrame) -> pd.DataFrame:
         else:
             df[col] = df[col].fillna(df["close"])
     return df
+
+
+def _compute_daily_quality(raw: pd.DataFrame, normalized: pd.DataFrame) -> dict[str, object]:
+    """Score daily-history quality and expose compact audit flags."""
+    score = 100.0
+    flags: list[str] = []
+    points = len(normalized)
+    if points < 30:
+        score -= 35
+        flags.append("short_history_lt30")
+    elif points < 60:
+        score -= 15
+        flags.append("short_history_lt60")
+
+    for col in ("open", "high", "low", "close"):
+        if col not in normalized.columns:
+            score -= 20
+            flags.append(f"missing_{col}")
+            continue
+        missing_ratio = float(pd.to_numeric(normalized[col], errors="coerce").isna().mean())
+        if missing_ratio > 0:
+            score -= min(missing_ratio * 40, 20)
+            flags.append(f"incomplete_{col}")
+
+    if "volume" not in normalized.columns:
+        score -= 12
+        flags.append("missing_volume")
+    else:
+        volume = pd.to_numeric(normalized["volume"], errors="coerce")
+        missing_volume_ratio = float(volume.isna().mean())
+        if missing_volume_ratio > 0:
+            score -= min(missing_volume_ratio * 20, 10)
+            flags.append("incomplete_volume")
+
+    if bool(raw.attrs.get("daily_stale")):
+        score -= 25
+        flags.append("stale_cache")
+
+    source_errors = list(raw.attrs.get("source_errors", []) or [])
+    if source_errors:
+        score -= min(len(source_errors) * 5, 20)
+        flags.append("fallback_errors")
+
+    return {
+        "daily_quality_score": round(max(score, 0.0), 4),
+        "daily_quality_flags": ";".join(flags),
+    }
 
 
 def _compute_shape_features(

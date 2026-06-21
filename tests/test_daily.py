@@ -54,6 +54,25 @@ def test_compute_daily_features_adds_trend_fields():
     assert float(features["volatility_20d_pct"]) >= 0
     assert float(features["max_drawdown_20d_pct"]) <= 0
     assert float(features["atr_20_pct"]) > 0
+    assert features["daily_quality_score"] == 100.0
+    assert features["daily_quality_flags"] == ""
+
+
+def test_compute_daily_features_flags_short_stale_fallback_history():
+    hist = pd.DataFrame({
+        "日期": pd.date_range("2026-01-01", periods=25).astype(str),
+        "收盘": [10 + i * 0.1 for i in range(25)],
+    })
+    hist.attrs["daily_stale"] = True
+    hist.attrs["source_errors"] = ["tencent offline", "sina offline"]
+
+    features = compute_daily_features(hist)
+
+    assert float(features["daily_quality_score"]) < 60
+    flags = str(features["daily_quality_flags"])
+    assert "short_history_lt30" in flags
+    assert "stale_cache" in flags
+    assert "fallback_errors" in flags
 
 
 def test_fetch_daily_history_retries_transient_source_errors(monkeypatch):
@@ -524,6 +543,8 @@ def test_enrich_daily_features_keeps_successful_rows_when_one_fetch_fails(monkey
     assert "600000" in result.attrs["daily_errors"][0]
     assert result.loc[0, "daily_data_points"] == 80
     assert result.loc[0, "daily_source"] == "akshare"
+    assert result.loc[0, "daily_quality_score"] == 88.0
+    assert result.loc[0, "daily_quality_flags"] == "missing_volume"
     assert pd.isna(result.loc[1, "daily_data_points"])
 
 

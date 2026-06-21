@@ -134,6 +134,8 @@ class Pick:
     volatility_20d_pct: float | None = None
     max_drawdown_20d_pct: float | None = None
     atr_20_pct: float | None = None
+    daily_quality_score: float | None = None
+    daily_quality_flags: str = ""
     daily_source: str = ""
     factor_scores: dict[str, float] = field(default_factory=dict)
     llm_confidence: float | None = None

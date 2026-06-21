@@ -61,6 +61,8 @@ _DEFAULT_SCORING_PROFILE = {
     "stability_drawdown_penalty_slope": 1.2,
     "stability_high_atr_pct": 6.0,
     "stability_high_atr_penalty_slope": 2.0,
+    "stability_low_daily_quality_score": 80.0,
+    "stability_low_daily_quality_penalty_slope": 0.35,
     "theme_heat_unknown_score": 50.0,
     "theme_heat_change_slope": 6.0,
     "theme_heat_rank_bonus": 10.0,
@@ -347,6 +349,12 @@ def _compute_stability_score(df: pd.DataFrame, profile: dict[str, float]) -> pd.
         score -= (
             atr - profile["stability_high_atr_pct"]
         ).clip(lower=0).fillna(0) * profile["stability_high_atr_penalty_slope"]
+
+    if "daily_quality_score" in df.columns:
+        quality = pd.to_numeric(df["daily_quality_score"], errors="coerce")
+        score -= (
+            profile["stability_low_daily_quality_score"] - quality
+        ).clip(lower=0).fillna(0) * profile["stability_low_daily_quality_penalty_slope"]
 
     return score.clip(0, 100)
 
