@@ -1,7 +1,11 @@
 import pandas as pd
 import pytest
 
-from alphasift.filter import SnapshotFieldMissingError, apply_hard_filters
+from alphasift.filter import (
+    SnapshotFieldMissingError,
+    apply_hard_filters,
+    hard_filter_rejection_summary,
+)
 from alphasift.models import HardFilterConfig
 
 
@@ -75,6 +79,26 @@ def test_apply_hard_filters_uses_daily_features_when_present():
     )
 
     assert result["name"].tolist() == ["示例A"]
+
+
+def test_hard_filter_rejection_summary_reports_sequential_counts():
+    df = pd.DataFrame([
+        {"name": "A", "amount": 200_000_000, "ma_bullish": True, "signal_score": 80},
+        {"name": "B", "amount": 20_000_000, "ma_bullish": True, "signal_score": 90},
+        {"name": "C", "amount": 210_000_000, "ma_bullish": False, "signal_score": 95},
+        {"name": "D", "amount": 220_000_000, "ma_bullish": True, "signal_score": 40},
+    ])
+
+    summary = hard_filter_rejection_summary(
+        df,
+        HardFilterConfig(amount_min=100_000_000, require_ma_bullish=True, signal_score_min=70),
+    )
+
+    assert summary == [
+        "amount_min removed 1 (4->3)",
+        "require_ma_bullish removed 1 (3->2)",
+        "signal_score_min removed 1 (2->1)",
+    ]
 
 
 def test_apply_hard_filters_uses_daily_shape_features_when_present():

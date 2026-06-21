@@ -90,6 +90,8 @@ def test_pipeline_enriches_daily_features_for_daily_strategy(monkeypatch):
     assert "Daily K-line sources: tencent=2" in result.degradation
     assert "Daily K-line quality flags: fallback_errors=1" in result.degradation
     assert "Daily K-line source ordering: daily source order adjusted by health: tencent,sina" in result.degradation
+    assert any("Daily hard-filter rejections:" in item for item in result.degradation)
+    assert any("require_ma_bullish removed 1" in item for item in result.degradation)
 
 
 def test_pipeline_preserves_degradation_when_hard_filter_empty(monkeypatch):

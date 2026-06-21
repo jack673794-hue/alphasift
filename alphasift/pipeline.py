@@ -12,7 +12,12 @@ from alphasift.candidate_context import collect_candidate_context
 from alphasift.context import build_llm_context
 from alphasift.daily import enrich_daily_features
 from alphasift.dsa_provider import apply_dsa_provider_context
-from alphasift.filter import apply_hard_filters, requires_daily_features, without_daily_filters
+from alphasift.filter import (
+    apply_hard_filters,
+    hard_filter_rejection_summary,
+    requires_daily_features,
+    without_daily_filters,
+)
 from alphasift.industry import enrich_industry_concepts
 from alphasift.models import Pick, ScreenResult
 from alphasift.normalize import (
@@ -227,8 +232,18 @@ def screen(
                 suffix = f" | +{len(daily_errors) - 5} more" if len(daily_errors) > 5 else ""
                 degradation.append(f"Daily K-line enrichment row errors: {sample}{suffix}")
             if daily_needed:
+                daily_filter_rejections = hard_filter_rejection_summary(
+                    enriched,
+                    screening.hard_filters,
+                    limit=6,
+                )
                 df = apply_hard_filters(enriched, screening.hard_filters)
                 after_filter_count = len(df)
+                if daily_filter_rejections:
+                    degradation.append(
+                        "Daily hard-filter rejections: "
+                        + "; ".join(daily_filter_rejections)
+                    )
             else:
                 df = enriched
         except Exception as exc:

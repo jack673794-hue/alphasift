@@ -100,6 +100,91 @@ def apply_hard_filters(df: pd.DataFrame, filters: HardFilterConfig) -> pd.DataFr
     return result.loc[mask].copy()
 
 
+def hard_filter_rejection_summary(
+    df: pd.DataFrame,
+    filters: HardFilterConfig,
+    *,
+    limit: int = 8,
+) -> list[str]:
+    """Return compact sequential hard-filter rejection counts."""
+    if df.empty or limit <= 0:
+        return []
+
+    mask = pd.Series(True, index=df.index)
+    diagnostics: list[str] = []
+
+    def record(label: str, next_mask: pd.Series) -> None:
+        nonlocal mask
+        before = int(mask.sum())
+        after = int(next_mask.sum())
+        removed = before - after
+        if removed > 0 and len(diagnostics) < limit:
+            diagnostics.append(f"{label} removed {removed} ({before}->{after})")
+        mask = next_mask
+
+    if filters.exclude_st:
+        name_col = _find_col(df, ["name", "股票名称", "名称"]) if mask.any() else None
+        if not name_col:
+            raise SnapshotFieldMissingError(
+                "Missing required snapshot column for exclude_st filter: name"
+            )
+        record("exclude_st", mask & ~df[name_col].str.contains(r"ST|退", na=False))
+
+    def record_min(label: str, columns: list[str], value: float | None) -> None:
+        if value is not None:
+            record(label, _filter_min(df, mask, columns, value))
+
+    def record_max(label: str, columns: list[str], value: float | None) -> None:
+        if value is not None:
+            record(label, _filter_max(df, mask, columns, value))
+
+    record_min("amount_min", ["amount", "成交额"], filters.amount_min)
+    record_min("price_min", ["price", "最新价", "现价"], filters.price_min)
+    record_max("price_max", ["price", "最新价", "现价"], filters.price_max)
+    record_min("market_cap_min", ["total_mv", "总市值"], filters.market_cap_min)
+    record_max("market_cap_max", ["total_mv", "总市值"], filters.market_cap_max)
+    record_min("pe_ttm_min", ["pe_ratio", "市盈率"], filters.pe_ttm_min)
+    record_max("pe_ttm_max", ["pe_ratio", "市盈率"], filters.pe_ttm_max)
+    record_min("pb_min", ["pb_ratio", "市净率"], filters.pb_min)
+    record_max("pb_max", ["pb_ratio", "市净率"], filters.pb_max)
+    record_min("volume_ratio_min", ["volume_ratio", "量比"], filters.volume_ratio_min)
+    record_min("turnover_rate_min", ["turnover_rate", "换手率"], filters.turnover_rate_min)
+    record_min("change_pct_min", ["change_pct", "涨跌幅"], filters.change_pct_min)
+    record_max("change_pct_max", ["change_pct", "涨跌幅"], filters.change_pct_max)
+    record_min("change_60d_min", ["change_60d"], filters.change_60d_min)
+    record_max("change_60d_max", ["change_60d"], filters.change_60d_max)
+
+    if filters.require_ma_bullish:
+        record("require_ma_bullish", _filter_bool_true(df, mask, "ma_bullish", True))
+    if filters.require_price_above_ma20:
+        record("require_price_above_ma20", _filter_bool_true(df, mask, "price_above_ma20", True))
+
+    record_min("signal_score_min", ["signal_score"], filters.signal_score_min)
+    if filters.macd_status_whitelist:
+        record("macd_status_whitelist", _filter_in(df, mask, "macd_status", filters.macd_status_whitelist))
+    if filters.rsi_status_whitelist:
+        record("rsi_status_whitelist", _filter_in(df, mask, "rsi_status", filters.rsi_status_whitelist))
+    record_min("breakout_20d_pct_min", ["breakout_20d_pct"], filters.breakout_20d_pct_min)
+    record_max("breakout_20d_pct_max", ["breakout_20d_pct"], filters.breakout_20d_pct_max)
+    record_max("range_20d_pct_max", ["range_20d_pct"], filters.range_20d_pct_max)
+    record_min("volume_ratio_20d_min", ["volume_ratio_20d"], filters.volume_ratio_20d_min)
+    record_max("volume_ratio_20d_max", ["volume_ratio_20d"], filters.volume_ratio_20d_max)
+    record_min("body_pct_min", ["body_pct"], filters.body_pct_min)
+    record_max("body_pct_max", ["body_pct"], filters.body_pct_max)
+    record_min("pullback_to_ma20_pct_min", ["pullback_to_ma20_pct"], filters.pullback_to_ma20_pct_min)
+    record_max("pullback_to_ma20_pct_max", ["pullback_to_ma20_pct"], filters.pullback_to_ma20_pct_max)
+    record_min("consolidation_days_20d_min", ["consolidation_days_20d"], filters.consolidation_days_20d_min)
+    record_max("consolidation_days_20d_max", ["consolidation_days_20d"], filters.consolidation_days_20d_max)
+    record_min("volatility_20d_pct_min", ["volatility_20d_pct"], filters.volatility_20d_pct_min)
+    record_max("volatility_20d_pct_max", ["volatility_20d_pct"], filters.volatility_20d_pct_max)
+    record_min("max_drawdown_20d_pct_min", ["max_drawdown_20d_pct"], filters.max_drawdown_20d_pct_min)
+    record_max("max_drawdown_20d_pct_max", ["max_drawdown_20d_pct"], filters.max_drawdown_20d_pct_max)
+    record_min("atr_20_pct_min", ["atr_20_pct"], filters.atr_20_pct_min)
+    record_max("atr_20_pct_max", ["atr_20_pct"], filters.atr_20_pct_max)
+
+    return diagnostics
+
+
 def requires_daily_features(filters: HardFilterConfig) -> bool:
     """Return whether a hard-filter config needs daily K-line features."""
     return any([
