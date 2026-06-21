@@ -89,6 +89,7 @@ _SCORING_PROFILE_KEYS = {
     "stability_high_atr_penalty_slope",
     "stability_low_daily_quality_score",
     "stability_low_daily_quality_penalty_slope",
+    "stability_bad_daily_quality_flag_penalty",
     "theme_heat_unknown_score",
     "theme_heat_change_slope",
     "theme_heat_rank_bonus",

@@ -149,8 +149,10 @@ def fetch_daily_history(
             if _has_tushare_token()
             else ("tencent", "sina", "akshare", "baostock")
         )
+        sources, source_order_notes = _rank_daily_sources_by_health(sources)
     elif src in ("akshare", "baostock", "tushare", "tencent", "sina", "yfinance"):
         sources = (src,)
+        source_order_notes = []
     else:
         raise ValueError(f"Unsupported daily source: {source}")
 
@@ -207,6 +209,8 @@ def fetch_daily_history(
                 _record_source_success(current, rows=len(result))
                 result.attrs["daily_source"] = current
                 result.attrs["daily_requested_source"] = src
+                result.attrs["daily_source_order"] = list(sources)
+                result.attrs["daily_source_order_notes"] = list(source_order_notes)
                 result.attrs["source_errors"] = list(errors)
                 result.attrs["daily_source_health"] = _daily_source_health_snapshot(sources)
                 if cache_path is not None:
@@ -234,6 +238,8 @@ def fetch_daily_history(
         )
         if stale is not None:
             stale.attrs["daily_stale"] = True
+            stale.attrs["daily_source_order"] = list(sources)
+            stale.attrs["daily_source_order_notes"] = list(source_order_notes)
             stale.attrs["source_errors"] = list(errors)
             stale.attrs["daily_source_health"] = _daily_source_health_snapshot(sources)
             return stale
@@ -263,6 +269,28 @@ def _normalize_max_workers(value: int | None) -> int:
     if value is None:
         return _DAILY_ENRICH_MAX_WORKERS
     return max(1, int(value))
+
+
+def _rank_daily_sources_by_health(sources: tuple[str, ...]) -> tuple[tuple[str, ...], list[str]]:
+    """Move unhealthy daily sources later while preserving default order ties."""
+    now = time.monotonic()
+    with _SOURCE_HEALTH_LOCK:
+        health = {source: dict(_SOURCE_HEALTH.get(source, {})) for source in sources}
+    default_rank = {source: idx for idx, source in enumerate(sources)}
+
+    def rank_key(source: str) -> tuple[int, float, float, int]:
+        state = health.get(source, {})
+        disabled_until = float(state.get("disabled_until", 0.0))
+        disabled = disabled_until > now
+        failures = float(state.get("failures", 0.0))
+        successes = float(state.get("successes", 0.0))
+        avg_rows = float(state.get("avg_rows", 0.0))
+        return (1 if disabled else 0, failures, -successes - (avg_rows / 10000.0), default_rank[source])
+
+    ranked = tuple(sorted(sources, key=rank_key))
+    if ranked == sources:
+        return sources, []
+    return ranked, [f"daily source order adjusted by health: {','.join(ranked)}"]
 
 
 def _source_disabled_reason(source: str) -> str | None:
@@ -372,7 +400,7 @@ def _read_daily_history_cache(
         df = pd.DataFrame(data, columns=columns)
         metadata = payload.get("metadata")
         if isinstance(metadata, dict):
-            for key in ("daily_source", "daily_requested_source", "source_errors", "daily_source_health"):
+            for key in ("daily_source", "daily_requested_source", "daily_source_order", "daily_source_order_notes", "source_errors", "daily_source_health"):
                 if key in metadata:
                     df.attrs[key] = metadata[key]
         if is_stale:
@@ -402,6 +430,8 @@ def _write_daily_history_cache(
             "metadata": {
                 "daily_source": df.attrs.get("daily_source", source),
                 "daily_requested_source": df.attrs.get("daily_requested_source", source),
+                "daily_source_order": list(df.attrs.get("daily_source_order", [])),
+                "daily_source_order_notes": list(df.attrs.get("daily_source_order_notes", [])),
                 "source_errors": list(df.attrs.get("source_errors", [])),
                 "daily_source_health": df.attrs.get("daily_source_health", {}),
             },
@@ -856,6 +886,22 @@ def _compute_daily_quality(raw: pd.DataFrame, normalized: pd.DataFrame) -> dict[
         if missing_volume_ratio > 0:
             score -= min(missing_volume_ratio * 20, 10)
             flags.append("incomplete_volume")
+        if (volume.dropna() < 0).any():
+            score -= 20
+            flags.append("negative_volume")
+
+    if {"open", "high", "low", "close"}.issubset(normalized.columns):
+        open_ = pd.to_numeric(normalized["open"], errors="coerce")
+        high = pd.to_numeric(normalized["high"], errors="coerce")
+        low = pd.to_numeric(normalized["low"], errors="coerce")
+        close = pd.to_numeric(normalized["close"], errors="coerce")
+        invalid_ohlc = (high < low) | (high < open_) | (high < close) | (low > open_) | (low > close)
+        if invalid_ohlc.fillna(False).any():
+            score -= 30
+            flags.append("invalid_ohlc")
+        if ((open_ <= 0) | (high <= 0) | (low <= 0) | (close <= 0)).fillna(False).any():
+            score -= 35
+            flags.append("non_positive_price")
 
     if bool(raw.attrs.get("daily_stale")):
         score -= 25

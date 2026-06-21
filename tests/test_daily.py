@@ -11,6 +11,7 @@ from alphasift.daily import compute_daily_features, daily_source_health_snapshot
 from alphasift.daily import (
     _SOURCE_HEALTH,
     _normalize_tushare_adj,
+    _rank_daily_sources_by_health,
     _record_source_failure,
     _record_source_success,
     _source_disabled_reason,
@@ -73,6 +74,24 @@ def test_compute_daily_features_flags_short_stale_fallback_history():
     assert "short_history_lt30" in flags
     assert "stale_cache" in flags
     assert "fallback_errors" in flags
+
+
+def test_compute_daily_features_flags_invalid_ohlcv_quality():
+    hist = pd.DataFrame({
+        "日期": pd.date_range("2026-01-01", periods=35).astype(str),
+        "开盘": [10] * 35,
+        "最高": [11] * 34 + [8],
+        "最低": [9] * 35,
+        "收盘": [10] * 35,
+        "成交量": [1000] * 34 + [-1],
+    })
+
+    features = compute_daily_features(hist)
+
+    flags = str(features["daily_quality_flags"])
+    assert "invalid_ohlc" in flags
+    assert "negative_volume" in flags
+    assert float(features["daily_quality_score"]) < 60
 
 
 def test_fetch_daily_history_retries_transient_source_errors(monkeypatch):
@@ -142,6 +161,19 @@ def test_daily_source_health_tracks_success_failure_and_rows(monkeypatch):
     assert snapshot["sina"]["avg_rows"] == 30.0
 
 
+def test_daily_source_health_reorders_auto_sources(monkeypatch):
+    _SOURCE_HEALTH.clear()
+    monkeypatch.setattr("alphasift.daily.time.monotonic", lambda: 100.0)
+    _record_source_failure("tencent")
+    _record_source_failure("tencent")
+    _record_source_success("sina", rows=60)
+
+    ranked, notes = _rank_daily_sources_by_health(("tencent", "sina", "akshare"))
+
+    assert ranked == ("sina", "akshare", "tencent")
+    assert notes == ["daily source order adjusted by health: sina,akshare,tencent"]
+
+
 def test_fetch_daily_history_uses_cache_until_ttl(tmp_path, monkeypatch):
     calls = {"count": 0}
 
@@ -178,6 +210,8 @@ def test_fetch_daily_history_uses_cache_until_ttl(tmp_path, monkeypatch):
     assert first.attrs["daily_source"] == "akshare"
     assert second.attrs["daily_source"] == "akshare"
     assert second.attrs["daily_requested_source"] == "akshare"
+    assert second.attrs["daily_source_order"] == ["akshare"]
+    assert second.attrs["daily_source_order_notes"] == []
     assert second.attrs["daily_source_health"]["akshare"]["successes"] == 1.0
     assert second.attrs["daily_source_health"]["akshare"]["last_rows"] == 40.0
     assert len(list((tmp_path / "daily_history").glob("*.json"))) == 1

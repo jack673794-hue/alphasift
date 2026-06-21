@@ -175,8 +175,8 @@ def test_theme_heat_factor_uses_reliable_trend_and_cooling_signal():
 
 def test_stability_factor_penalizes_high_daily_volatility_and_deep_drawdown():
     df = pd.DataFrame([
-        {"code": "controlled", "change_pct": 0.5, "volatility_20d_pct": 22.0, "max_drawdown_20d_pct": -4.0, "atr_20_pct": 2.5, "daily_quality_score": 100},
-        {"code": "wild", "change_pct": 0.5, "volatility_20d_pct": 75.0, "max_drawdown_20d_pct": -24.0, "atr_20_pct": 9.0, "daily_quality_score": 60},
+        {"code": "controlled", "change_pct": 0.5, "volatility_20d_pct": 22.0, "max_drawdown_20d_pct": -4.0, "atr_20_pct": 2.5, "daily_quality_score": 100, "daily_quality_flags": ""},
+        {"code": "wild", "change_pct": 0.5, "volatility_20d_pct": 75.0, "max_drawdown_20d_pct": -24.0, "atr_20_pct": 9.0, "daily_quality_score": 60, "daily_quality_flags": "invalid_ohlc"},
     ])
 
     scored = compute_screen_scores(
