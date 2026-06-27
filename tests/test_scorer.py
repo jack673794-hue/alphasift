@@ -173,6 +173,41 @@ def test_theme_heat_factor_uses_reliable_trend_and_cooling_signal():
     assert scored.loc["thin", "factor_theme_heat_score"] > scored.loc["cooling", "factor_theme_heat_score"]
 
 
+def test_topic_alignment_factor_matches_candidate_topics_to_hotspot_summary():
+    df = pd.DataFrame([
+        {
+            "code": "aligned",
+            "industry": "银行",
+            "concepts": "低估值,中特估",
+            "board_heat_summary": "银行:+1.20%:rank=3|地产:+0.20%:rank=8",
+            "board_heat_score": 82,
+        },
+        {
+            "code": "mismatch",
+            "industry": "医药",
+            "concepts": "创新药",
+            "board_heat_summary": "银行:+1.20%:rank=3|地产:+0.20%:rank=8",
+            "board_heat_score": 82,
+        },
+        {
+            "code": "unknown",
+            "industry": "",
+            "concepts": "",
+            "board_heat_summary": "银行:+1.20%:rank=3",
+            "board_heat_score": 82,
+        },
+    ])
+
+    scored = compute_screen_scores(
+        df,
+        ScreeningConfig(factor_weights={"topic_alignment": 1.0}),
+    ).set_index("code")
+
+    assert scored.loc["aligned", "factor_topic_alignment_score"] > scored.loc["unknown", "factor_topic_alignment_score"]
+    assert scored.loc["unknown", "factor_topic_alignment_score"] > scored.loc["mismatch", "factor_topic_alignment_score"]
+    assert scored.loc["aligned", "screen_score"] > scored.loc["mismatch", "screen_score"]
+
+
 def test_stability_factor_penalizes_high_daily_volatility_and_deep_drawdown():
     df = pd.DataFrame([
         {"code": "controlled", "change_pct": 0.5, "volatility_20d_pct": 22.0, "max_drawdown_20d_pct": -4.0, "atr_20_pct": 2.5, "daily_quality_score": 100, "daily_quality_flags": ""},

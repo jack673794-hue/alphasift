@@ -14,6 +14,7 @@ _FACTOR_COLUMNS = {
     "stability": "factor_stability_score",
     "size": "factor_size_score",
     "theme_heat": "factor_theme_heat_score",
+    "topic_alignment": "factor_topic_alignment_score",
 }
 _DEFAULT_SCORING_PROFILE = {
     "momentum_base": 60.0,
@@ -79,6 +80,10 @@ _DEFAULT_SCORING_PROFILE = {
     "theme_heat_cooling_score_penalty_cap": 10.0,
     "theme_heat_overheat_score": 88.0,
     "theme_heat_overheat_penalty_slope": 0.5,
+    "topic_alignment_unknown_score": 50.0,
+    "topic_alignment_match_bonus": 25.0,
+    "topic_alignment_heat_weight": 0.25,
+    "topic_alignment_unmatched_penalty": 12.0,
 }
 
 
@@ -140,6 +145,7 @@ def _compute_factor_scores(df: pd.DataFrame, config: ScreeningConfig | None = No
         "stability": _compute_stability_score(df, profile),
         "size": _compute_size_score(df),
         "theme_heat": _compute_theme_heat_score(df, profile),
+        "topic_alignment": _compute_topic_alignment_score(df, profile),
     }
 
 
@@ -430,6 +436,47 @@ def _compute_theme_heat_score(df: pd.DataFrame, profile: dict[str, float]) -> pd
     overheat = (score - profile["theme_heat_overheat_score"]).clip(lower=0)
     score = score - overheat * profile["theme_heat_overheat_penalty_slope"]
     return score.clip(0, 100)
+
+
+def _compute_topic_alignment_score(df: pd.DataFrame, profile: dict[str, float]) -> pd.Series:
+    """Score whether industry/concept labels align with hotspot route summaries."""
+    base = pd.Series(profile["topic_alignment_unknown_score"], index=df.index)
+    if not {"industry", "concepts", "board_heat_summary"} & set(df.columns):
+        return base
+
+    scores = []
+    for _, row in df.iterrows():
+        candidate_topics = _topic_tokens(row.get("industry")) | _topic_tokens(row.get("concepts"))
+        route_topics = _topic_tokens(row.get("board_heat_summary"))
+        if not candidate_topics or not route_topics:
+            scores.append(float(profile["topic_alignment_unknown_score"]))
+            continue
+        overlap = candidate_topics & route_topics
+        score = float(profile["topic_alignment_unknown_score"])
+        if overlap:
+            score += float(profile["topic_alignment_match_bonus"])
+            heat = pd.to_numeric(row.get("board_heat_score"), errors="coerce")
+            if pd.notna(heat):
+                score += max(float(heat) - 50.0, 0.0) * float(profile["topic_alignment_heat_weight"])
+        else:
+            score -= float(profile["topic_alignment_unmatched_penalty"])
+        scores.append(score)
+    return pd.Series(scores, index=df.index).clip(0, 100)
+
+
+def _topic_tokens(value: object) -> set[str]:
+    text = str(value or "").strip()
+    if not text or text.lower() in {"nan", "none", "<na>"}:
+        return set()
+    normalized = text
+    for sep in ["|", ",", "，", ";", "；", "/"]:
+        normalized = normalized.replace(sep, " ")
+    tokens = set()
+    for raw in normalized.split():
+        token = raw.split(":", 1)[0].strip()
+        if token and token.lower() not in {"rank", "nan", "none", "<na>"}:
+            tokens.add(token)
+    return tokens
 
 
 def _numeric_column(df: pd.DataFrame, column: str) -> pd.Series:
