@@ -72,6 +72,7 @@ def test_pipeline_enriches_daily_features_for_daily_strategy(monkeypatch):
     result = screen(
         "shrink_pullback",
         use_llm=False,
+        explain_filters=True,
         config=Config(
             llm_api_key="",
             snapshot_source_priority=["test"],
@@ -99,6 +100,8 @@ def test_pipeline_enriches_daily_features_for_daily_strategy(monkeypatch):
     assert any("sina total_failures=1,last_rows=30" in item for item in result.degradation)
     assert any("Daily hard-filter rejections:" in item for item in result.degradation)
     assert any("require_ma_bullish removed 1" in item for item in result.degradation)
+    assert any("Snapshot hard-filter waterfall:" in item for item in result.degradation)
+    assert any("Daily hard-filter waterfall:" in item for item in result.degradation)
 
 
 def test_daily_source_health_notes_prioritize_severe_states_and_limit_noise():

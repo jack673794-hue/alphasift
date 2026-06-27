@@ -141,6 +141,7 @@ def main():
         default=None,
         help="日 K 增强最多处理的候选数",
     )
+    sp.add_argument("--explain-filters", action="store_true", help="输出 hard filter waterfall 诊断")
     sp.add_argument("--save-run", action="store_true", help="保存本次运行到 ALPHASIFT_DATA_DIR/runs")
     sp.add_argument("--output", default=None, help="额外写出结果到指定路径")
     sp.add_argument("--jsonl", action="store_true", help="以 JSONL 输出")
@@ -269,6 +270,7 @@ def main():
             post_analysis_max_picks=args.post_analysis_max_picks,
             daily_enrich=args.daily_enrich,
             daily_enrich_max_candidates=args.daily_enrich_max_candidates,
+            explain_filters=args.explain_filters,
             deep_analysis=args.deep_analysis,
             deep_analysis_max_picks=args.deep_analysis_max_picks,
             config=config,

@@ -5,6 +5,7 @@ from alphasift.filter import (
     SnapshotFieldMissingError,
     apply_hard_filters,
     hard_filter_rejection_summary,
+    hard_filter_waterfall,
 )
 from alphasift.models import HardFilterConfig
 
@@ -99,6 +100,36 @@ def test_hard_filter_rejection_summary_reports_sequential_counts():
         "require_ma_bullish removed 1 (3->2)",
         "signal_score_min removed 1 (2->1)",
     ]
+
+
+def test_hard_filter_waterfall_reports_samples_and_suggestions():
+    df = pd.DataFrame([
+        {"code": "000001", "name": "A", "amount": 200_000_000, "signal_score": 80},
+        {"code": "000002", "name": "B", "amount": 20_000_000, "signal_score": 90},
+        {"code": "000003", "name": "C", "amount": 210_000_000, "signal_score": 40},
+    ])
+
+    waterfall = hard_filter_waterfall(
+        df,
+        HardFilterConfig(amount_min=100_000_000, signal_score_min=95),
+    )
+
+    assert waterfall[0]["filter"] == "exclude_st"
+    assert waterfall[0]["before"] == 3
+    assert waterfall[0]["after"] == 3
+    assert waterfall[1] == {
+        "filter": "amount_min",
+        "before": 3,
+        "after": 2,
+        "removed": 1,
+        "removed_pct": 33.3333,
+        "samples": [{"code": "000002", "name": "B", "value": 20_000_000}],
+    }
+    assert waterfall[2]["filter"] == "signal_score_min"
+    assert waterfall[2]["before"] == 2
+    assert waterfall[2]["after"] == 0
+    assert waterfall[2]["removed"] == 2
+    assert "eliminated all remaining candidates" in str(waterfall[2]["suggestion"])
 
 
 def test_apply_hard_filters_uses_daily_shape_features_when_present():

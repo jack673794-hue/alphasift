@@ -15,6 +15,7 @@ from alphasift.dsa_provider import apply_dsa_provider_context
 from alphasift.filter import (
     apply_hard_filters,
     hard_filter_rejection_summary,
+    hard_filter_waterfall,
     requires_daily_features,
     without_daily_filters,
 )
@@ -55,6 +56,7 @@ def screen(
     post_analysis_max_picks: int | None = None,
     daily_enrich: bool | None = None,
     daily_enrich_max_candidates: int | None = None,
+    explain_filters: bool = False,
     deep_analysis: bool = False,
     deep_analysis_max_picks: int | None = None,
     context: dict[str, object] | None = None,
@@ -79,6 +81,7 @@ def screen(
         post_analysis_max_picks: Override max number of picks sent to post analyzers.
         daily_enrich: Whether to enrich shortlisted candidates with daily K-line features.
         daily_enrich_max_candidates: Max candidates to enrich after snapshot filtering.
+        explain_filters: Whether to include sequential hard-filter waterfall diagnostics.
         deep_analysis: Backward-compatible alias for post_analyzers=["dsa"].
         deep_analysis_max_picks: Backward-compatible max-picks alias for DSA.
         context: Optional host runtime context. DSA may provide LLM settings and
@@ -169,6 +172,13 @@ def screen(
 
     # 3. L1 hard filter. If a strategy needs daily features, first apply only
     # snapshot-safe filters, then enrich a narrowed candidate pool.
+    if explain_filters:
+        snapshot_waterfall = hard_filter_waterfall(snapshot_df, snapshot_filters)
+        if snapshot_waterfall:
+            degradation.append(
+                "Snapshot hard-filter waterfall: "
+                + _format_filter_waterfall(snapshot_waterfall)
+            )
     df = apply_hard_filters(snapshot_df, snapshot_filters)
     after_filter_count = len(df)
 
@@ -237,6 +247,13 @@ def screen(
                 suffix = f" | +{len(daily_errors) - 5} more" if len(daily_errors) > 5 else ""
                 degradation.append(f"Daily K-line enrichment row errors: {sample}{suffix}")
             if daily_needed:
+                if explain_filters:
+                    daily_waterfall = hard_filter_waterfall(enriched, screening.hard_filters)
+                    if daily_waterfall:
+                        degradation.append(
+                            "Daily hard-filter waterfall: "
+                            + _format_filter_waterfall(daily_waterfall)
+                        )
                 daily_filter_rejections = hard_filter_rejection_summary(
                     enriched,
                     screening.hard_filters,
@@ -625,6 +642,32 @@ def _daily_source_health_notes(health: dict[str, object], *, limit: int = 4) -> 
     if hidden_count > 0:
         notes.append(f"+{hidden_count} more")
     return notes
+
+
+def _format_filter_waterfall(steps: list[dict[str, object]], *, limit: int = 8) -> str:
+    parts: list[str] = []
+    for step in steps[:limit]:
+        text = (
+            f"{step.get('filter')} {step.get('before')}->{step.get('after')} "
+            f"removed={step.get('removed')}"
+        )
+        samples = step.get("samples")
+        if isinstance(samples, list) and samples:
+            sample_names = [
+                str(item.get("name") or item.get("code") or item.get("value") or "")
+                for item in samples
+                if isinstance(item, dict)
+            ]
+            sample_names = [item for item in sample_names if item]
+            if sample_names:
+                text += f" samples={','.join(sample_names[:3])}"
+        if step.get("suggestion"):
+            text += f" next={step.get('suggestion')}"
+        parts.append(text)
+    hidden = len(steps) - len(parts)
+    if hidden > 0:
+        parts.append(f"+{hidden} more")
+    return "; ".join(parts)
 
 
 def _safe_text(v: object) -> str:
