@@ -12,6 +12,7 @@ from pathlib import Path
 
 from alphasift.audit import audit_project
 from alphasift.config import Config
+from alphasift.doctor import doctor_data_sources, write_doctor_report
 from alphasift.evaluate import evaluate_saved_run, evaluate_saved_runs
 from alphasift.hotspot import (
     append_hotspot_history,
@@ -217,6 +218,19 @@ def main():
     # audit
     ap = sub.add_parser("audit", help="评估项目能力、策略配置覆盖和已知短板")
     ap.add_argument("--json", action="store_true", help="以 JSON 输出")
+
+    # doctor
+    dp = sub.add_parser("doctor", help="诊断运行环境和数据源")
+    doctor_sub = dp.add_subparsers(dest="doctor_command")
+    dsp = doctor_sub.add_parser("data-sources", help="诊断 snapshot / daily 数据源状态")
+    dsp.add_argument("--snapshot-source", action="append", default=None, help="snapshot 来源，可重复或逗号分隔")
+    dsp.add_argument("--daily-source", default=None, help="daily K 来源，默认使用 DAILY_SOURCE/config")
+    dsp.add_argument("--daily-code", default="000001", help="daily K smoke test 股票代码，默认 000001")
+    dsp.add_argument("--no-live", action="store_true", help="只输出配置和内存 health，不发起网络取数")
+    dsp.add_argument("--no-daily", action="store_true", help="跳过 daily K smoke test")
+    dsp.add_argument("--output", default=None, help="额外写出 JSON 诊断报告")
+    dsp.add_argument("--json", action="store_true", help="以 JSON 输出")
+    dsp.add_argument("--explain", action="store_true", help="输出紧凑可读摘要")
 
     # quickstart
     qp = sub.add_parser(
@@ -457,6 +471,25 @@ def main():
             print(json.dumps(result, ensure_ascii=False, indent=2))
         else:
             print(_format_audit_explain(result))
+
+    elif args.command == "doctor":
+        if args.doctor_command != "data-sources":
+            parser.error("doctor requires a subcommand, e.g. doctor data-sources")
+        config = Config.from_env()
+        result = doctor_data_sources(
+            config,
+            snapshot_sources=_split_csv_args(args.snapshot_source) or None,
+            daily_source=args.daily_source,
+            daily_code=args.daily_code,
+            run_live=not args.no_live,
+            check_daily=not args.no_daily,
+        )
+        if args.output:
+            write_doctor_report(args.output, result)
+        if args.json or not args.explain:
+            print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        else:
+            print(_format_data_sources_doctor_explain(result.to_dict()))
 
     elif args.command == "quickstart":
         _run_quickstart(strategy=args.strategy, max_output=args.max_output)
@@ -778,6 +811,37 @@ def _format_audit_explain(result: dict) -> str:
     lines.append("next_priorities:")
     for item in result.get("next_priorities", []):
         lines.append(f"- {item}")
+    return "\n".join(lines)
+
+
+def _format_data_sources_doctor_explain(result: dict) -> str:
+    snapshot = result.get("snapshot", {}) or {}
+    daily = result.get("daily", {}) or {}
+    config = result.get("config", {}) or {}
+    lines = [
+        f"status={result.get('status')} generated_at={result.get('generated_at')}",
+        (
+            "snapshot "
+            f"status={snapshot.get('status')} source={snapshot.get('source') or '-'} "
+            f"rows={snapshot.get('rows', 0)} fallback={snapshot.get('fallback_used')} "
+            f"stale={snapshot.get('stale')} sources={','.join(snapshot.get('sources') or [])}"
+        ),
+    ]
+    if snapshot.get("errors"):
+        lines.append("snapshot_errors=" + " | ".join(str(item) for item in snapshot.get("errors") or []))
+    if daily:
+        lines.append(
+            "daily "
+            f"status={daily.get('status')} source={daily.get('source') or '-'} "
+            f"rows={daily.get('rows', 0)} stale={daily.get('stale')} "
+            f"code={config.get('daily_code') or '-'} requested={config.get('daily_source') or '-'}"
+        )
+        if daily.get("errors"):
+            lines.append("daily_errors=" + " | ".join(str(item) for item in daily.get("errors") or []))
+    lines.append(f"tushare_configured={config.get('tushare_configured')} live_checks={config.get('live_checks')}")
+    recommendations = result.get("recommendations") or []
+    if recommendations:
+        lines.append("recommendations=" + " | ".join(str(item) for item in recommendations))
     return "\n".join(lines)
 
 

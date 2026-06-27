@@ -158,8 +158,31 @@ def _record_source_failure(source: str) -> None:
         state = _SOURCE_HEALTH.setdefault(source, {"failures": 0.0, "disabled_until": 0.0})
         failures = float(state.get("failures", 0.0)) + 1.0
         state["failures"] = failures
+        state["total_failures"] = float(state.get("total_failures", 0.0)) + 1.0
+        state["last_failure_at"] = time.time()
         if failures >= _SOURCE_HEALTH_FAILURE_THRESHOLD:
             state["disabled_until"] = now + _SOURCE_HEALTH_COOLDOWN_SECONDS
+
+
+def snapshot_source_health_snapshot(
+    sources: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, dict[str, float | bool]]:
+    """Return in-process snapshot-source health without exposing credentials."""
+    now = time.monotonic()
+    requested = tuple(sources or tuple(_SOURCE_HEALTH))
+    with _SOURCE_HEALTH_LOCK:
+        snapshot: dict[str, dict[str, float | bool]] = {}
+        for source in requested:
+            state = dict(_SOURCE_HEALTH.get(source, {}))
+            disabled_until = float(state.get("disabled_until", 0.0))
+            snapshot[source] = {
+                "successes": 0.0,
+                "failures": float(state.get("failures", 0.0)),
+                "total_failures": float(state.get("total_failures", 0.0)),
+                "last_rows": 0.0,
+                "disabled": disabled_until > now,
+            }
+    return snapshot
 
 
 def _write_last_good_snapshot(
