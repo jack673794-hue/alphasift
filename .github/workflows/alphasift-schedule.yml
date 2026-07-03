@@ -2,14 +2,13 @@ name: AlphaSift 定时选股
 
 on:
   schedule:
-    # 每个工作日上午 9:30（北京时间）运行，UTC 1:30
-    - cron: '30 1 * * 1-5'
+    - cron: '0 2 * * 1-5'   # UTC 2:00 = 北京时间 10:00
   workflow_dispatch:  # 支持手动触发
 
 jobs:
   screen:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: 检出代码
@@ -21,20 +20,21 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: 安装依赖
+      - name: 安装系统依赖（akshare 需要）
         run: |
-          pip install --upgrade pip
-          pip install -e .
-          pip install -r requirements.txt
+          sudo apt-get update
+          sudo apt-get install -y gcc g++
+
+      - name: 安装 Python 依赖
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install akshare pandas numpy tqdm rich typer
+          pip install .   # 正式安装（非开发模式）
 
       - name: 执行选股（双低策略，不带LLM排序）
-        env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          # 如果有 Tushare 或其他数据源，可在此添加
         run: |
           mkdir -p reports
-          alphasift screen dual_low --no-llm --top 20 > reports/dual_low_$(date +'%Y%m%d_%H%M').txt
-          # 如果希望使用 LLM 排序，请去掉 --no-llm 参数
+          python -m alphasift.cli screen dual_low --no-llm --top 20 > reports/dual_low_$(date +'%Y%m%d_%H%M').txt 2>&1
 
       - name: 上传报告
         uses: actions/upload-artifact@v4
