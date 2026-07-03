@@ -2,7 +2,7 @@ name: AlphaSift 定时选股
 
 on:
   schedule:
-    - cron: '0 2 * * 1-5'   # UTC 2:00 = 北京时间 10:00
+    - cron: '0 2 * * 1-5'
   workflow_dispatch:
 
 jobs:
@@ -40,15 +40,10 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE
           echo "当前工作目录: $(pwd)"
-          ls -la
           mkdir -p reports
-          echo "reports 目录已创建"
-          python -m alphasift.cli screen dual_low --no-llm --source akshare --top 10 > reports/dual_low_$(date +'%Y%m%d_%H%M').txt 2>&1
+          echo "开始选股..."
+          python -m alphasift.cli screen dual_low --no-llm --source akshare --top 10
           echo "选股执行完毕，退出码: $?"
-          # 如果文件生成成功，打印前几行以便查看
-          if [ -f reports/dual_low_*.txt ]; then
-            head -n 20 reports/dual_low_*.txt
-          fi
 
       - name: 上传报告
         uses: actions/upload-artifact@v4
