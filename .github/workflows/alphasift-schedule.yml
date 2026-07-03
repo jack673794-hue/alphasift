@@ -36,12 +36,15 @@ jobs:
           python -c "import alphasift; print('✅ alphasift 导入成功')"
           python -c "import akshare; print('✅ akshare 导入成功')"
 
-      - name: 执行选股（使用免费数据源）
-        run: |
-          mkdir -p reports
-          # 使用 --source akshare 明确指定免费数据源，增加 --debug 输出详细信息
-          python -m alphasift.cli screen dual_low --no-llm --source akshare --top 10 > reports/dual_low_$(date +'%Y%m%d_%H%M').txt 2>&1
-          echo "选股执行完毕，退出码: $?"
+     - name: 执行选股（使用免费数据源）
+  run: |
+    cd $GITHUB_WORKSPACE          # 切换到项目根目录
+    pwd                          # 打印当前目录，便于调试
+    ls -la                       # 列出文件，确认权限
+    mkdir -p reports
+    echo "当前目录: $(pwd)"
+    python -m alphasift.cli screen dual_low --no-llm --source akshare --top 10 > reports/dual_low_$(date +'%Y%m%d_%H%M').txt 2>&1
+    echo "选股执行完毕，退出码: $?"
 
       - name: 上传报告
         uses: actions/upload-artifact@v4
