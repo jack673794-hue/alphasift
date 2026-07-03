@@ -25,20 +25,47 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc g++
 
-      - name: 安装 Python 依赖（完全参照本地）
+      - name: 安装 Python 依赖
         run: |
           python -m pip install --upgrade pip setuptools wheel
           pip install akshare pandas numpy tqdm rich typer
           pip install .
 
-      - name: 验证安装（参照本地测试）
+      - name: 验证安装
         run: |
           python -c "import sys; import alphasift.cli as cli; sys.argv=['alphasift','quickstart']; cli.main()"
 
-      - name: 执行选股（完全参照本地命令）
+      - name: 执行选股并保存结果
+        id: screen
         run: |
           mkdir -p reports
           python -c "import sys; import alphasift.cli as cli; sys.argv=['alphasift','screen','dual_low','--no-llm','--source','akshare','--top','10']; cli.main()" 2>&1 | tee reports/dual_low_$(date +'%Y%m%d_%H%M').txt
+          # 提取 Top 10 结果（跳过表头，取纯文本）
+          grep -E '^[[:space:]]*[0-9]+[[:space:]]+[0-9]{6}' reports/*.txt | head -10 > reports/top10.txt || true
+
+      - name: 发送飞书通知
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+        if: env.FEISHU_WEBHOOK_URL != ''
+        run: |
+          # 检查是否有选股结果
+          if [ -f reports/top10.txt ] && [ -s reports/top10.txt ]; then
+            # 构建消息内容
+            CONTENT="📊 **AlphaSift 双低选股结果**\n日期: $(date '+%Y-%m-%d %H:%M')\n策略: dual_low (低PE+低PB)\n\n"
+            CONTENT="${CONTENT}\`\`\`\n排名  代码    名称      得分  价格   PE    PB\n"
+            CONTENT="${CONTENT}$(cat reports/top10.txt)\n"
+            CONTENT="${CONTENT}\`\`\`\n💡 完整报告可查看 GitHub Actions Artifacts"
+            
+            # 发送到飞书
+            curl -X POST -H "Content-Type: application/json" \
+              -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"${CONTENT}\"}}" \
+              $FEISHU_WEBHOOK_URL
+          else
+            # 发送失败提醒
+            curl -X POST -H "Content-Type: application/json" \
+              -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"⚠️ AlphaSift 今日选股未产生结果，请检查运行日志。\"}}" \
+              $FEISHU_WEBHOOK_URL
+          fi
 
       - name: 上传报告
         uses: actions/upload-artifact@v4
