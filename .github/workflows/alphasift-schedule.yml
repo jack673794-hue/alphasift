@@ -35,13 +35,14 @@ jobs:
         run: |
           python -c "import sys; import alphasift.cli as cli; sys.argv=['alphasift','quickstart']; cli.main()"
 
-      - name: 执行选股并保存结果
-        id: screen
-        run: |
-          mkdir -p reports
-          python -c "import sys; import alphasift.cli as cli; sys.argv=['alphasift','screen','dual_low','--no-llm','--source','akshare','--top','10']; cli.main()" 2>&1 | tee reports/dual_low_$(date +'%Y%m%d_%H%M').txt
-          # 提取 Top 10 结果（跳过表头，取纯文本）
-          grep -E '^[[:space:]]*[0-9]+[[:space:]]+[0-9]{6}' reports/*.txt | head -10 > reports/top10.txt || true
+      - name: 执行选股
+  run: |
+    cd $GITHUB_WORKSPACE
+    echo "当前工作目录: $(pwd)"
+    mkdir -p reports
+    echo "开始选股（策略: balanced_alpha，数据源: baostock）..."
+    python -c "import sys; import alphasift.cli as cli; sys.argv=['alphasift','screen','balanced_alpha','--no-llm','--source','baostock','--top','10']; cli.main()" 2>&1 | tee reports/balanced_alpha_$(date +'%Y%m%d_%H%M').txt
+    echo "选股执行完毕，退出码: $?"
 
       - name: 发送飞书通知
         env:
